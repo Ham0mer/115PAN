@@ -7,10 +7,30 @@ registerPage('account', async (container) => {
         ${acct.loggedIn ? `
           <div class="card">
             <div class="card-header">当前账号</div>
-            <p>用户ID: ${acct.userId}</p>
-            <p>用户名: ${acct.userName}</p>
-            <p>登录时间: ${acct.createdAt}</p>
-            <p>状态: <span class="text-success">正常</span></p>
+            <div style="display:flex;gap:16px;align-items:flex-start">
+              ${acct.faceM ? `<img src="${acct.faceM}" alt="avatar" referrerpolicy="no-referrer" crossorigin="anonymous" style="width:64px;height:64px;border-radius:50%;object-fit:cover;flex-shrink:0" onerror="this.style.display='none'">` : ''}
+              <div style="flex:1;min-width:0">
+                <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+                  <strong style="font-size:16px">${esc(acct.userName || '')}</strong>
+                  ${acct.vipInfo?.level_name ? `<span style="background:linear-gradient(135deg,#f5b942,#e8941a);color:#fff;padding:2px 8px;border-radius:10px;font-size:12px">${esc(acct.vipInfo.level_name)}</span>` : ''}
+                </div>
+                <p style="margin:2px 0;color:var(--text-secondary,#666);font-size:13px">用户ID: ${acct.userId}</p>
+                <p style="margin:2px 0;color:var(--text-secondary,#666);font-size:13px">登录时间: ${acct.createdAt}</p>
+                ${acct.vipInfo?.expire_date ? `<p style="margin:2px 0;color:var(--text-secondary,#666);font-size:13px">VIP 到期: ${esc(acct.vipInfo.expire_date)}${acct.vipInfo.is_forever ? '（永久）' : ''}</p>` : ''}
+                <p style="margin:2px 0;color:var(--text-secondary,#666);font-size:13px">状态: <span class="text-success">正常</span></p>
+              </div>
+            </div>
+            ${acct.sizeTotalRaw > 0 ? `
+              <div style="margin-top:14px">
+                <div style="display:flex;justify-content:space-between;font-size:13px;margin-bottom:4px">
+                  <span>存储空间</span>
+                  <span><strong>${esc(acct.sizeUsed)}</strong> / ${esc(acct.sizeTotal)} (${acct.sizePercent}%)</span>
+                </div>
+                <div style="background:var(--border,#eee);border-radius:6px;height:8px;overflow:hidden">
+                  <div style="height:100%;width:${Math.min(acct.sizePercent, 100)}%;background:linear-gradient(90deg,#42a5f5,${acct.sizePercent > 90 ? '#ef5350' : '#1976d2'});transition:width 0.3s"></div>
+                </div>
+              </div>
+            ` : ''}
           </div>
           <div class="flex gap-8 mt-16">
             <button class="btn btn-primary" id="btn-scan-new">重新扫码登录</button>

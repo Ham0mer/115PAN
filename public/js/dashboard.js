@@ -14,9 +14,29 @@ registerPage('dashboard', async (container) => {
       <div class="card-row">
         <div class="card">
           <div class="card-header">115 账号状态</div>
-          ${stats.cookieStatus === 'active'
-            ? `<p class="text-success">已登录: ${stats.cookieUser}</p>`
-            : '<p class="text-error">未登录</p>'}
+          ${stats.cookieStatus === 'active' ? `
+            <div style="display:flex;gap:12px;align-items:center">
+              ${stats.cookieFaceM ? `<img src="${stats.cookieFaceM}" alt="" referrerpolicy="no-referrer" crossorigin="anonymous" style="width:48px;height:48px;border-radius:50%;object-fit:cover;flex-shrink:0" onerror="this.style.display='none'">` : ''}
+              <div style="flex:1;min-width:0">
+                <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+                  <strong>${stats.cookieUser}</strong>
+                  ${stats.cookieVipName ? `<span style="background:linear-gradient(135deg,#f5b942,#e8941a);color:#fff;padding:1px 6px;border-radius:8px;font-size:11px">${stats.cookieVipName}</span>` : ''}
+                </div>
+                ${stats.cookieVipExpire ? `<div style="font-size:12px;color:var(--text-secondary,#888);margin-top:2px">VIP 到期: ${stats.cookieVipExpire}${stats.cookieVipForever ? '（永久）' : ''}</div>` : ''}
+              </div>
+            </div>
+            ${stats.cookieSizeTotal ? `
+              <div style="margin-top:10px">
+                <div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:3px">
+                  <span>存储</span>
+                  <span>${stats.cookieSizeUsed} / ${stats.cookieSizeTotal} (${stats.cookieSizePercent}%)</span>
+                </div>
+                <div style="background:var(--border,#eee);border-radius:4px;height:6px;overflow:hidden">
+                  <div style="height:100%;width:${Math.min(stats.cookieSizePercent, 100)}%;background:linear-gradient(90deg,#42a5f5,${stats.cookieSizePercent > 90 ? '#ef5350' : '#1976d2'})"></div>
+                </div>
+              </div>
+            ` : ''}
+          ` : '<p class="text-error">未登录</p>'}
         </div>
         <div class="card">
           <div class="card-header">系统信息</div>

@@ -130,8 +130,20 @@ export async function fetch115UserInfo(cookieStr, appName = 'apple_tv') {
 export function saveCookie(cookieStr, userInfo) {
   const db = getDb();
   db.prepare("UPDATE cookies_115 SET status='replaced', updated_at=datetime('now','localtime') WHERE status='active'").run();
-  db.prepare(`INSERT INTO cookies_115 (cookie_str, user_id, user_name, status) VALUES (?,?,?,'active')`)
-    .run(cookieStr, String(userInfo.user_id || ''), userInfo.user_name || '');
+  db.prepare(`INSERT INTO cookies_115
+      (cookie_str, user_id, user_name, face_m, size_used, size_total, size_used_raw, size_total_raw, vip_info, status)
+      VALUES (?,?,?,?,?,?,?,?,?, 'active')`)
+    .run(
+      cookieStr,
+      String(userInfo.user_id || ''),
+      userInfo.user_name || '',
+      userInfo.face?.face_m || '',
+      userInfo.size_used || '',
+      userInfo.size_total || '',
+      Number(userInfo.size_used_raw) || 0,
+      Number(userInfo.size_total_raw) || 0,
+      userInfo.vip_info ? JSON.stringify(userInfo.vip_info) : null,
+    );
   // Purge replaced cookies older than 7 days
   db.prepare("DELETE FROM cookies_115 WHERE status='replaced' AND updated_at < datetime('now','-7 days','localtime')").run();
   logger.info('115', `Cookie已保存，用户: ${userInfo.user_name}`);

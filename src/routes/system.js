@@ -20,6 +20,11 @@ systemRouter.get('/stats', (req, res) => {
   const lastTask = db.prepare('SELECT * FROM tasks ORDER BY created_at DESC LIMIT 1').get();
   const cookie = db.prepare("SELECT * FROM cookies_115 WHERE status='active' LIMIT 1").get();
 
+  let vipInfo = null;
+  try { vipInfo = cookie?.vip_info ? JSON.parse(cookie.vip_info) : null; } catch {}
+  const used = Number(cookie?.size_used_raw) || 0;
+  const total = Number(cookie?.size_total_raw) || 0;
+
   res.json({
     todayCount,
     monthCount,
@@ -28,7 +33,15 @@ systemRouter.get('/stats', (req, res) => {
     lastTask,
     cookieStatus: cookie ? 'active' : 'none',
     cookieUser: cookie?.user_name || '',
+    cookieFaceM: cookie?.face_m || '',
+    cookieSizeUsed: cookie?.size_used || '',
+    cookieSizeTotal: cookie?.size_total || '',
+    cookieSizePercent: total > 0 ? +(used / total * 100).toFixed(2) : 0,
+    cookieVipName: vipInfo?.level_name || '',
+    cookieVipExpire: vipInfo?.expire_date || '',
+    cookieVipForever: !!vipInfo?.is_forever,
     uptime: process.uptime(),
+    nodeVersion: process.version,
   });
 });
 

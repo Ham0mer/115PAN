@@ -32,12 +32,18 @@ registerPage('config', async (container) => {
             <div class="card-header">扫描与过滤</div>
             <div class="form-row">
               <div class="form-group"><label>扫描频率（分钟）</label><input type="number" id="cfg-scan-interval" value="${cfg.scan_interval_min||10}" min="5"></div>
-              <div class="form-group"><label>操作延时（秒）</label><input type="number" id="cfg-op-delay" value="${cfg.operation_delay_sec||1.5}" step="0.5" min="0"></div>
-              <div class="form-group"><label>小文件过滤（MB）</label><input type="number" id="cfg-min-size" value="${cfg.min_video_size_mb||0}" step="1" min="0"></div>
+              <div class="form-group"><label>操作延时（秒）</label><input type="number" id="cfg-op-delay" value="${cfg.operation_delay_sec||10}" step="0.5" min="0"></div>
+              <div class="form-group"><label>小文件过滤（MB）</label><input type="number" id="cfg-min-size" value="${cfg.min_video_size_mb||100}" step="1" min="0"></div>
             </div>
             <div class="form-row">
-              <div class="form-group" style="flex:2"><label>视频文件类型</label><input type="text" id="cfg-video-exts" value="${cfg.video_extensions||'mp4,mkv,avi,mov,rmvb,wmv,ts,iso,m2ts'}"></div>
-              <div class="form-group" style="flex:2"><label>元数据文件类型</label><input type="text" id="cfg-meta-exts" value="${cfg.meta_extensions||'ass,srt,ssa,sub,vtt,nfo,xml'}"></div>
+              <div class="form-group" style="flex:2">
+                <label>视频文件类型</label>
+                ${renderTagInput('video-exts', cfg.video_extensions || 'mp4,mkv,avi,mov,rmvb,wmv,ts,iso,m2ts')}
+              </div>
+              <div class="form-group" style="flex:2">
+                <label>元数据文件类型</label>
+                ${renderTagInput('meta-exts', cfg.meta_extensions || 'ass,srt,ssa,sub,vtt,nfo,xml')}
+              </div>
             </div>
           </div>
 
@@ -92,9 +98,78 @@ registerPage('config', async (container) => {
       `;
 
       bindConfigEvents(cfg);
+      bindTagInputs();
     } catch (err) {
       container.innerHTML = `<div class="error-msg">加载失败: ${err.message}</div>`;
     }
+  }
+
+  function renderTagInput(field, value) {
+    const tags = String(value || '')
+      .split(',')
+      .map(s => s.trim().toLowerCase())
+      .filter(Boolean);
+    const chips = tags.map(t => tagChip(t)).join('');
+    return `
+      <div class="tag-input" data-field="${field}" style="display:flex;flex-wrap:wrap;gap:6px;padding:6px;border:1px solid var(--border, #ccc);border-radius:6px;background:var(--input-bg, #fff);min-height:38px;align-items:center">
+        <div class="tag-list" style="display:contents">${chips}</div>
+        <input type="text" class="tag-input-field" placeholder="输入扩展名，回车添加"
+          style="border:none;outline:none;background:transparent;flex:1;min-width:120px;padding:4px">
+      </div>
+    `;
+  }
+
+  function tagChip(text) {
+    return `<span class="tag-chip" data-value="${esc(text)}" style="display:inline-flex;align-items:center;gap:4px;padding:2px 8px;background:var(--primary-bg, #e3f2fd);color:var(--primary, #1976d2);border-radius:12px;font-size:13px">
+      ${esc(text)}
+      <button type="button" class="tag-remove" style="border:none;background:transparent;color:inherit;cursor:pointer;font-size:14px;line-height:1;padding:0">×</button>
+    </span>`;
+  }
+
+  function collectTags(field) {
+    const box = document.querySelector(`.tag-input[data-field="${field}"]`);
+    if (!box) return '';
+    return Array.from(box.querySelectorAll('.tag-chip'))
+      .map(c => c.dataset.value)
+      .join(',');
+  }
+
+  function bindTagInputs() {
+    document.querySelectorAll('.tag-input').forEach(box => {
+      const input = box.querySelector('.tag-input-field');
+      const list = box.querySelector('.tag-list');
+
+      const addTag = (raw) => {
+        const v = String(raw || '').trim().toLowerCase().replace(/^\./, '');
+        if (!v) return;
+        const existing = Array.from(box.querySelectorAll('.tag-chip')).map(c => c.dataset.value);
+        if (existing.includes(v)) { input.value = ''; return; }
+        list.insertAdjacentHTML('beforeend', tagChip(v));
+        input.value = '';
+      };
+
+      input.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ',') {
+          e.preventDefault();
+          addTag(input.value);
+        } else if (e.key === 'Backspace' && !input.value) {
+          const chips = box.querySelectorAll('.tag-chip');
+          if (chips.length) chips[chips.length - 1].remove();
+        }
+      });
+
+      input.addEventListener('blur', () => {
+        if (input.value.trim()) addTag(input.value);
+      });
+
+      box.addEventListener('click', (e) => {
+        if (e.target.classList.contains('tag-remove')) {
+          e.target.closest('.tag-chip').remove();
+        } else if (e.target === box) {
+          input.focus();
+        }
+      });
+    });
   }
 
   function bindConfigEvents() {
@@ -108,8 +183,8 @@ registerPage('config', async (container) => {
         target_cid: document.getElementById('cfg-target-cid').value,
         target_name: document.getElementById('cfg-target-name').value,
         scan_interval_min: parseInt(document.getElementById('cfg-scan-interval').value),
-        video_extensions: document.getElementById('cfg-video-exts').value,
-        meta_extensions: document.getElementById('cfg-meta-exts').value,
+        video_extensions: collectTags('video-exts'),
+        meta_extensions: collectTags('meta-exts'),
         rename_enabled: document.getElementById('cfg-rename').checked ? 1 : 0,
         ffprobe_enabled: document.getElementById('cfg-ffprobe').checked ? 1 : 0,
         ai_enabled: document.getElementById('cfg-ai').checked ? 1 : 0,

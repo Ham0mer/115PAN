@@ -52,12 +52,23 @@ router115.post('/qr/confirm', async (req, res) => {
 router115.get('/account', (req, res) => {
   const cookie = getActiveCookie();
   if (!cookie) return res.json({ loggedIn: false });
+  let vipInfo = null;
+  try { vipInfo = cookie.vip_info ? JSON.parse(cookie.vip_info) : null; } catch {}
+  const used = Number(cookie.size_used_raw) || 0;
+  const total = Number(cookie.size_total_raw) || 0;
   res.json({
     loggedIn: true,
     userId: cookie.user_id,
     userName: cookie.user_name,
     createdAt: cookie.created_at,
     status: cookie.status,
+    faceM: cookie.face_m || '',
+    sizeUsed: cookie.size_used || '',
+    sizeTotal: cookie.size_total || '',
+    sizeUsedRaw: used,
+    sizeTotalRaw: total,
+    sizePercent: total > 0 ? +(used / total * 100).toFixed(2) : 0,
+    vipInfo,
   });
 });
 

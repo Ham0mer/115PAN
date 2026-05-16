@@ -1,10 +1,10 @@
 services:
-  arrange115:
-    image: 115arrange:latest
-    container_name: 115arrange
+  115pan:
+    image: 115pan:latest
+    container_name: 115pan
     restart: unless-stopped
     ports:
-      - "3000:3000"
+      - "2333:2333"
     environment:
       - TZ=Asia/Shanghai
       - NODE_ENV=production

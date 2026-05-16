@@ -15,7 +15,7 @@ COPY --from=builder /app/public ./public
 COPY --from=builder /app/config ./config
 COPY package.json ./
 RUN mkdir -p /app/data/thumbnails /app/logs
-EXPOSE 3000
+EXPOSE 2333
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD curl -fs http://localhost:3000/api/health || exit 1
+  CMD curl -fs http://localhost:2333/api/health || exit 1
 CMD ["node", "src/server.js"]
