@@ -84,8 +84,8 @@ export async function runOrganize(taskId, options = {}) {
     if (!files.length) {
       logger.info('Organizer', `源目录无文件，仅清理残留空目录 cid=${cfg.source_cid}`);
       await cleanupEmptyFolders(cfg.source_cid);
-      db.prepare(`UPDATE tasks SET status='completed', ended_at=datetime('now','localtime'),
-        scan_count=0, success_count=0, fail_count=0, skip_count=0 WHERE id=?`).run(taskId);
+      db.prepare('DELETE FROM task_items WHERE task_id=?').run(taskId);
+      db.prepare('DELETE FROM tasks WHERE id=?').run(taskId);
       cleanupCancelToken(taskId);
       return { taskId, stats };
     }

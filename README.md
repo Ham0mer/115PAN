@@ -35,6 +35,10 @@ docker run -d \
 ```bash
 docker compose up -d
 ```
+更新
+```bash
+docker compose pull && docker compose down && docker compose up -d && docker compose logs -f
+```
 
 ### 本地运行
 
