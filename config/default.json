@@ -1,0 +1,7 @@
+{
+  "server": { "port": 2333, "host": "0.0.0.0" },
+  "admin": { "username": "admin", "password": "admin123" },
+  "database": { "path": "./data/app.db" },
+  "logs": { "dir": "./logs", "retainDays": 30, "level": "info" },
+  "scheduler": { "cookieRefreshHours": 12, "autoRetryHours": 24 }
+}

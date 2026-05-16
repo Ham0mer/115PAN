@@ -1,0 +1,14 @@
+services:
+  arrange115:
+    image: 115arrange:latest
+    container_name: 115arrange
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - TZ=Asia/Shanghai
+      - NODE_ENV=production
+    volumes:
+      - ./config:/app/config
+      - ./data:/app/data
+      - ./logs:/app/logs

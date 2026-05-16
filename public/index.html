@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>115 网盘整理系统</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;460;480;500;520;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+<div id="app">
+  <!-- Login screen -->
+  <div id="page-login" class="page">
+    <div class="login-container">
+      <div class="login-brand">
+        <div class="brand-logo">115</div>
+        <h1>网盘整理系统</h1>
+      </div>
+      <form id="login-form">
+        <input type="text" id="login-username" placeholder="用户名" required autocomplete="username">
+        <input type="password" id="login-password" placeholder="密码" required autocomplete="current-password">
+        <button type="submit" class="btn btn-primary btn-block">登录</button>
+        <div id="login-error" class="error-msg" style="display:none"></div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Main layout -->
+  <div id="page-main" class="page" style="display:none">
+    <nav class="topnav">
+      <div class="topnav-inner">
+        <div class="topnav-brand">
+          <div class="brand-logo">115</div>
+          <span class="brand-title">整理系统</span>
+        </div>
+        <ul class="nav-menu" id="nav-menu">
+          <li><a href="#dashboard" data-page="dashboard">仪表盘</a></li>
+          <li><a href="#account" data-page="account">115 账号</a></li>
+          <li><a href="#config" data-page="config">整理配置</a></li>
+          <li><a href="#tasks" data-page="tasks">任务历史</a></li>
+          <li><a href="#unmatched" data-page="unmatched">识别失败 <span id="unmatched-badge" class="badge badge-warn" style="display:none">0</span></a></li>
+          <li class="nav-group">
+            <span class="nav-group-trigger">实用工具
+              <svg class="caret" viewBox="0 0 10 6" width="10" height="6" aria-hidden="true"><path d="M1 1l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </span>
+            <ul class="nav-dropdown">
+              <li><a href="#tools-tmdb" data-page="tools-tmdb">TMDB 配置</a></li>
+              <li><a href="#tools-ai" data-page="tools-ai">AI 辅助识别</a></li>
+              <li><a href="#tools-templates" data-page="tools-templates">命名模板</a></li>
+              <li><a href="#telegram" data-page="telegram">Telegram 通知</a></li>
+              <li><a href="#logs" data-page="logs">系统日志</a></li>
+            </ul>
+          </li>
+          <li><a href="#system" data-page="system">系统设置</a></li>
+        </ul>
+        <div class="topnav-right">
+          <span id="nav-user" class="user-chip"></span>
+          <button class="btn btn-ghost btn-sm" id="btn-logout">退出</button>
+        </div>
+      </div>
+    </nav>
+    <main class="content" id="main-content"></main>
+  </div>
+</div>
+
+<script src="/js/api.js"></script>
+<script src="/js/router.js"></script>
+<script src="/js/login.js"></script>
+<script src="/js/dashboard.js"></script>
+<script src="/js/account.js"></script>
+<script src="/js/config.js"></script>
+<script src="/js/tasks.js"></script>
+<script src="/js/unmatched.js"></script>
+<script src="/js/tools-tmdb.js"></script>
+<script src="/js/tools-ai.js"></script>
+<script src="/js/tools-templates.js"></script>
+<script src="/js/telegram.js"></script>
+<script src="/js/logs.js"></script>
+<script src="/js/system.js"></script>
+</body>
+</html>
