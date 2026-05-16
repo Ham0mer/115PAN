@@ -39,6 +39,7 @@ export async function fetch115Api(url, options = {}, retries = 3) {
   const headers = {
     'User-Agent': UA_APPLE_TV,
     'Accept': 'application/json',
+    'Referer': 'https://115.com/',
     ...(cookie ? { 'Cookie': cookie.cookie_str } : {}),
     ...options.headers,
   };
