@@ -27,7 +27,7 @@ docker run -d \
   -v $(pwd)/logs:/app/logs \
   -e TZ=Asia/Shanghai \
   --restart unless-stopped \
-  ghcr.io/<your-github-username>/115arrange:latest
+  ghcr.io/ham0mer/115pan:latest
 ```
 
 或使用 `docker-compose.yml`：

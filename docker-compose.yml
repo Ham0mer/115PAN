@@ -1,6 +1,6 @@
 services:
   115pan:
-    image: 115pan:latest
+    image: ghcr.io/ham0mer/115pan:latest
     container_name: 115pan
     restart: unless-stopped
     ports:
