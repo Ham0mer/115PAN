@@ -468,7 +468,9 @@ async function processMovieGroup(group, id, cfg, taskId, stats) {
 
   // Multi-version: dedupe by tmdb_id across videos AND existing library
   const winningFileName = videoUnits[0].folderName;
-  const movieFolderCid = await getOrCreateChildFolder(catCid, winningFileName);
+  const movieType = id.mediaType === 'anime' ? 'anime' : 'movie';
+  const movieFolderCid = (await findExistingShowCid(id.tmdbId, movieType, catCid))
+    ?? await getOrCreateChildFolder(catCid, winningFileName);
 
   for (const u of videoUnits) {
     const result = await placeVideo({
@@ -476,6 +478,7 @@ async function processMovieGroup(group, id, cfg, taskId, stats) {
       mediaInfo: u.mediaInfo,
       id,
       targetCid: movieFolderCid,
+      showCid: movieFolderCid,
       baseName: u.fileName,
       cfg,
       metas: group.metas,
@@ -547,7 +550,8 @@ async function processTVGroup(group, id, cfg, taskId, stats, cancel, episodeSumm
   const catCid = await ensureFolderPath(cfg.target_cid, categoryPath);
   const showSampleNames = generateTVNames(id, episodes[0].mediaInfo, episodes[0].season, episodes[0].episode);
   const showFolderName = showSampleNames.showName;
-  const showCid = await getOrCreateChildFolder(catCid, showFolderName);
+  const showCid = (await findExistingShowCid(id.tmdbId, id.mediaType, catCid))
+    ?? await getOrCreateChildFolder(catCid, showFolderName);
 
   const seasonsCache = new Map();
   const summaryItems = [];
@@ -570,6 +574,7 @@ async function processTVGroup(group, id, cfg, taskId, stats, cancel, episodeSumm
       mediaInfo: ep.mediaInfo,
       id,
       targetCid: seasonCid,
+      showCid,
       baseName: episodeName,
       cfg,
       metas: epMetas,
@@ -647,7 +652,7 @@ function matchMetasToEpisode(ep, allMetas) {
 
 // ----- Common: place one video + its metas into target, with conflict / multi-version handling -----
 
-async function placeVideo({ video, mediaInfo, id, targetCid, baseName, cfg, metas, mediaType, season, episode }) {
+async function placeVideo({ video, mediaInfo, id, targetCid, showCid, baseName, cfg, metas, mediaType, season, episode }) {
   const db = getDb();
   const ext = extOf(video.name);
 
@@ -738,14 +743,15 @@ async function placeVideo({ video, mediaInfo, id, targetCid, baseName, cfg, meta
   // Record into media_library
   try {
     db.prepare(`INSERT OR REPLACE INTO media_library
-      (media_type, tmdb_id, season, episode, target_cid, file_id, file_path, file_size,
+      (media_type, tmdb_id, season, episode, target_cid, show_cid, file_id, file_path, file_size,
        resolution, source, video_codec, audio_codec, dolby)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
         mediaType === 'anime' ? 'anime' : mediaType,
         id.tmdbId,
         season,
         episode,
         targetCid,
+        showCid ?? targetCid,
         video.id,
         placedName,
         video.size,
@@ -767,6 +773,41 @@ async function getOrCreateChildFolder(parentCid, name) {
   if (existing) return existing;
   const created = await createFolder(parentCid, name);
   return created.cid;
+}
+
+// Two-stage lookup for an existing show/movie folder by tmdbId:
+// 1. Query media_library (covers files organised by this system)
+// 2. Scan the 115 category folder for a subfolder whose name contains "tmdb-{tmdbId}"
+//    (covers pre-existing folders organised manually or by other tools that follow the
+//    default naming convention  "{title} ({year}) {tmdb-{tmdbId}}")
+async function findExistingShowCid(tmdbId, mediaType, catCid) {
+  // Stage 1: local DB
+  const db = getDb();
+  const types = mediaType === 'anime' ? ['anime', 'tv'] : [mediaType];
+  for (const t of types) {
+    const row = db.prepare(
+      `SELECT show_cid FROM media_library WHERE media_type=? AND tmdb_id=? AND show_cid IS NOT NULL LIMIT 1`
+    ).get(t, tmdbId);
+    if (row?.show_cid) {
+      logger.debug('Organizer', `DB命中已有文件夹 tmdb=${tmdbId} cid=${row.show_cid}`);
+      return row.show_cid;
+    }
+  }
+
+  // Stage 2: scan 115 category folder for "tmdb-{tmdbId}" in folder name
+  try {
+    const marker = `tmdb-${tmdbId}`;
+    const folders = await listFolder(catCid, { onlyFolders: true });
+    const hit = folders.find(f => f.name.includes(marker));
+    if (hit) {
+      logger.debug('Organizer', `115扫描命中已有文件夹 tmdb=${tmdbId} name="${hit.name}" cid=${hit.id}`);
+      return hit.id;
+    }
+  } catch (err) {
+    logger.debug('Organizer', `115文件夹扫描失败 tmdb=${tmdbId}: ${err.message}`);
+  }
+
+  return null;
 }
 
 // ----- Multi-version resolution -----
@@ -1070,7 +1111,8 @@ async function processTVManual(group, id, cfg, taskId, stats, cancel, overrides,
   const categoryPath = classifyTargetPath(id, cfg);
   const catCid = await ensureFolderPath(cfg.target_cid, categoryPath);
   const { showName } = generateTVNames(id, episodes[0].mediaInfo, episodes[0].season, episodes[0].episode);
-  const showCid = await getOrCreateChildFolder(catCid, showName);
+  const showCid = (await findExistingShowCid(id.tmdbId, id.mediaType, catCid))
+    ?? await getOrCreateChildFolder(catCid, showName);
   const seasonsCache = new Map();
 
   for (const ep of episodes) {
@@ -1088,6 +1130,7 @@ async function processTVManual(group, id, cfg, taskId, stats, cancel, overrides,
       mediaInfo: ep.mediaInfo,
       id,
       targetCid: seasonCid,
+      showCid,
       baseName: episodeName,
       cfg,
       metas: epMetas,

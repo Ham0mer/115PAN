@@ -27,7 +27,7 @@ registerPage('tools-tmdb', async (container) => {
           <div class="form-row">
             <div class="form-group" style="flex:1"><input type="text" id="tmdb-search-q" placeholder="搜索电影/剧集名称"></div>
             <div class="form-group" style="flex:0 0 120px"><select id="tmdb-search-type"><option value="">全部</option><option value="movie">电影</option><option value="tv">剧集</option></select></div>
-            <button class="btn" id="btn-tmdb-search" style="align-self:flex-end">搜索</button>
+            <button class="btn" id="btn-tmdb-search" style="align-self:flex-end;margin-bottom:16px">搜索</button>
           </div>
           <div id="tmdb-search-results"></div>
         </div>

@@ -28,7 +28,7 @@ registerPage('tools-ai', async (container) => {
           <div class="card-header">AI 识别测试</div>
           <div class="form-row">
             <div class="form-group" style="flex:1"><input type="text" id="ai-test-filename" placeholder="输入测试文件名"></div>
-            <button class="btn" id="btn-ai-identify" style="align-self:flex-end">识别</button>
+            <button class="btn" id="btn-ai-identify" style="align-self:flex-end;margin-bottom:16px">识别</button>
           </div>
           <div id="ai-identify-result" class="mt-8"></div>
         </div>
