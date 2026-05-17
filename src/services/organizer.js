@@ -1,8 +1,9 @@
 import { getDb } from './db.js';
 import { logger } from './logger.js';
 import {
-  listFilesRecursive, renameFile, moveFile, createFolder, ensureFolderPath,
-  moveToRecycle, listFolder, findFolderByName, deleteFolder,
+  listFilesRecursive, renameFile, renameFiles, moveFile, moveFiles, createFolder, ensureFolderPath,
+  moveToRecycle, moveToRecycleBatch, listFolder, findFolderByName, deleteFolder,
+  getFolderInfo, listAllSubFolders, listAllSubFiles, FolderTreeCache,
 } from './115.js';
 import {
   parseFilename,
@@ -25,6 +26,29 @@ const META_EXTS_DEFAULT = 'ass,srt,ssa,sub,vtt,nfo,xml';
 
 function getConfig() {
   return getDb().prepare('SELECT * FROM config_organize WHERE id=1').get();
+}
+
+// Best-effort: build an in-memory mirror of cfg.target_cid's folder subtree so
+// ensureFolderPath / getOrCreateChildFolder / findExistingShowCid can resolve
+// known paths without API calls. Stored on cfg so it's threaded implicitly
+// through every helper that already receives cfg. Failures degrade silently.
+async function attachTargetCache(cfg) {
+  if (!cfg || cfg._targetCache !== undefined) return cfg?._targetCache;
+  if (!cfg.target_cid || String(cfg.target_cid) === '0') {
+    cfg._targetCache = null;
+    return null;
+  }
+  try {
+    const cache = new FolderTreeCache(cfg.target_cid);
+    await cache.load();
+    cfg._targetCache = cache;
+    logger.info('Organizer', `目标目录树已缓存 cid=${cfg.target_cid} folders=${cache.byId.size - 1}`);
+    return cache;
+  } catch (err) {
+    logger.warn('Organizer', `加载目标目录树缓存失败，将走逐次查询: ${err.message}`);
+    cfg._targetCache = null;
+    return null;
+  }
 }
 
 function parseExts(csv, fallback) {
@@ -77,6 +101,7 @@ export async function runOrganize(taskId, options = {}) {
 
   try {
     logger.info('Organizer', `开始扫描 cid=${cfg.source_cid}`);
+    await attachTargetCache(cfg);
     const files = await listFilesRecursive(cfg.source_cid, { maxDepth: 8 });
     stats.scan = files.length;
     logger.info('Organizer', `扫描完成: ${files.length} 个文件`);
@@ -462,8 +487,9 @@ function classifyTargetPath(id, cfg) {
 
 async function processMovieGroup(group, id, cfg, taskId, stats) {
   // For each video in the group, decide multi-version vs single. Metas tag along by stem-prefix.
+  const cache = cfg._targetCache || null;
   const categoryPath = classifyTargetPath(id, cfg);
-  const catCid = await ensureFolderPath(cfg.target_cid, categoryPath);
+  const catCid = await ensureFolderPath(cfg.target_cid, categoryPath, cache);
 
   // For each video: extract per-file media info, build name
   const videoUnits = [];
@@ -478,8 +504,8 @@ async function processMovieGroup(group, id, cfg, taskId, stats) {
   // Multi-version: dedupe by tmdb_id across videos AND existing library
   const winningFileName = videoUnits[0].folderName;
   const movieType = id.mediaType === 'anime' ? 'anime' : 'movie';
-  const movieFolderCid = (await findExistingShowCid(id.tmdbId, movieType, catCid))
-    ?? await getOrCreateChildFolder(catCid, winningFileName);
+  const movieFolderCid = (await findExistingShowCid(id.tmdbId, movieType, catCid, cache))
+    ?? await getOrCreateChildFolder(catCid, winningFileName, cache);
 
   for (const u of videoUnits) {
     const result = await placeVideo({
@@ -555,12 +581,13 @@ async function processTVGroup(group, id, cfg, taskId, stats, cancel, episodeSumm
   if (!episodes.length) return;
 
   // Compute target paths once for the show
+  const cache = cfg._targetCache || null;
   const categoryPath = classifyTargetPath(id, cfg);
-  const catCid = await ensureFolderPath(cfg.target_cid, categoryPath);
+  const catCid = await ensureFolderPath(cfg.target_cid, categoryPath, cache);
   const showSampleNames = generateTVNames(id, episodes[0].mediaInfo, episodes[0].season, episodes[0].episode);
   const showFolderName = showSampleNames.showName;
-  const showCid = (await findExistingShowCid(id.tmdbId, id.mediaType, catCid))
-    ?? await getOrCreateChildFolder(catCid, showFolderName);
+  const showCid = (await findExistingShowCid(id.tmdbId, id.mediaType, catCid, cache))
+    ?? await getOrCreateChildFolder(catCid, showFolderName, cache);
 
   const seasonsCache = new Map();
   const summaryItems = [];
@@ -570,7 +597,7 @@ async function processTVGroup(group, id, cfg, taskId, stats, cancel, episodeSumm
     let seasonCid = seasonsCache.get(ep.season);
     if (!seasonCid) {
       const { seasonName } = generateTVNames(id, ep.mediaInfo, ep.season, ep.episode, ep.episodeEnd);
-      seasonCid = await getOrCreateChildFolder(showCid, seasonName);
+      seasonCid = await getOrCreateChildFolder(showCid, seasonName, cache);
       seasonsCache.set(ep.season, seasonCid);
     }
     const { episodeName } = generateTVNames(id, ep.mediaInfo, ep.season, ep.episode, ep.episodeEnd);
@@ -681,8 +708,12 @@ async function placeVideo({ video, mediaInfo, id, targetCid, showCid, baseName, 
     return 'recycled';
   }
   if (versionDecision.action === 'recycleExisting') {
+    const loserIds = versionDecision.losers.map(o => o.file_id).filter(Boolean);
+    if (loserIds.length) {
+      try { await moveToRecycleBatch(loserIds); }
+      catch (err) { logger.warn('Organizer', '回收旧版本失败', err.message); }
+    }
     for (const old of versionDecision.losers) {
-      try { if (old.file_id) await moveToRecycle(old.file_id); } catch (err) { logger.warn('Organizer', '回收旧版本失败', err.message); }
       db.prepare(`INSERT INTO recycle_records (source_path, file_id, file_size, winner_path, winner_size, loser_to, reason)
         VALUES (?,?,?,?,?,?,?)`).run(old.file_path, old.file_id, old.file_size, video.name, video.size, '', '多版本-被新版本替换');
       db.prepare('DELETE FROM media_library WHERE id=?').run(old.id);
@@ -725,12 +756,8 @@ async function placeVideo({ video, mediaInfo, id, targetCid, showCid, baseName, 
     }
   }
 
-  // Move and rename the video
-  await moveFile(video.id, targetCid);
-  if (cfg.rename_enabled) await renameFile(video.id, placedName);
-
-  // Place metas: rename each to share baseName + lang suffix, preserving extension
-  for (const m of metas) {
+  // Pre-compute meta target names so we can batch move + batch rename.
+  const metaPlan = metas.map(m => {
     const mExt = extOf(m.name);
     let metaName;
     if (cfg.rename_enabled) {
@@ -741,11 +768,37 @@ async function placeVideo({ video, mediaInfo, id, targetCid, showCid, baseName, 
     } else {
       metaName = m.name;
     }
+    return { id: m.id, name: m.name, newName: metaName };
+  });
+
+  // Batch move: video + all metas in a single 115 call.
+  const moveIds = [video.id, ...metaPlan.map(m => m.id)];
+  try {
+    await moveFiles(moveIds, targetCid);
+  } catch (err) {
+    // Fall back to per-file moves so a single bad fid doesn't sink the whole group.
+    logger.warn('Organizer', `批量移动失败，回退逐个: ${err.message}`);
+    try { await moveFile(video.id, targetCid); }
+    catch (e) { logger.warn('Organizer', `视频移动失败: ${video.name}`, e.message); }
+    for (const m of metaPlan) {
+      try { await moveFile(m.id, targetCid); }
+      catch (e) { logger.warn('Organizer', `元数据移动失败: ${m.name}`, e.message); }
+    }
+  }
+
+  // Batch rename: video + metas in a single 115 call.
+  if (cfg.rename_enabled) {
+    const renamePairs = [[video.id, placedName], ...metaPlan.map(m => [m.id, m.newName])];
     try {
-      await moveFile(m.id, targetCid);
-      if (cfg.rename_enabled) await renameFile(m.id, metaName);
+      await renameFiles(renamePairs);
     } catch (err) {
-      logger.warn('Organizer', `元数据移动失败: ${m.name}`, err.message);
+      logger.warn('Organizer', `批量重命名失败，回退逐个: ${err.message}`);
+      try { await renameFile(video.id, placedName); }
+      catch (e) { logger.warn('Organizer', `视频重命名失败: ${video.name}`, e.message); }
+      for (const m of metaPlan) {
+        try { await renameFile(m.id, m.newName); }
+        catch (e) { logger.warn('Organizer', `元数据重命名失败: ${m.name}`, e.message); }
+      }
     }
   }
 
@@ -777,10 +830,11 @@ async function placeVideo({ video, mediaInfo, id, targetCid, showCid, baseName, 
   return 'placed';
 }
 
-async function getOrCreateChildFolder(parentCid, name) {
-  const existing = await findFolderByName(parentCid, name);
+async function getOrCreateChildFolder(parentCid, name, cache = null) {
+  const existing = await findFolderByName(parentCid, name, cache);
   if (existing) return existing;
   const created = await createFolder(parentCid, name);
+  if (cache) cache.add(parentCid, name, created.cid);
   return created.cid;
 }
 
@@ -789,7 +843,7 @@ async function getOrCreateChildFolder(parentCid, name) {
 // 2. Scan the 115 category folder for a subfolder whose name contains "tmdb-{tmdbId}"
 //    (covers pre-existing folders organised manually or by other tools that follow the
 //    default naming convention  "{title} ({year}) {tmdb-{tmdbId}}")
-async function findExistingShowCid(tmdbId, mediaType, catCid) {
+async function findExistingShowCid(tmdbId, mediaType, catCid, cache = null) {
   // Stage 1: local DB
   const db = getDb();
   const types = mediaType === 'anime' ? ['anime', 'tv'] : [mediaType];
@@ -804,8 +858,20 @@ async function findExistingShowCid(tmdbId, mediaType, catCid) {
   }
 
   // Stage 2: scan 115 category folder for "tmdb-{tmdbId}" in folder name
+  const marker = `tmdb-${tmdbId}`;
+  if (cache) {
+    const catNode = cache.byId.get(String(catCid));
+    if (catNode) {
+      for (const [name, cid] of catNode.children) {
+        if (name.includes(marker)) {
+          logger.debug('Organizer', `缓存命中已有文件夹 tmdb=${tmdbId} name="${name}" cid=${cid}`);
+          return cid;
+        }
+      }
+      return null;
+    }
+  }
   try {
-    const marker = `tmdb-${tmdbId}`;
     const folders = await listFolder(catCid, { onlyFolders: true });
     const hit = folders.find(f => f.name.includes(marker));
     if (hit) {
@@ -963,6 +1029,7 @@ export async function rerunInPlace(originalTaskId) {
   if (!items.length) throw new Error('原任务无可重跑的条目');
 
   const cfg = getConfig();
+  await attachTargetCache(cfg);
   const newTask = db.prepare("INSERT INTO tasks (status, started_at) VALUES ('running', datetime('now','localtime'))").run();
   const newTaskId = newTask.lastInsertRowid;
   const cancel = getCancelToken(newTaskId);
@@ -991,19 +1058,20 @@ export async function rerunInPlace(originalTaskId) {
         if (!id.title || !id.year || !id.tmdbId) { stats.skip++; continue; }
 
         // Determine new target path
+        const cache = cfg._targetCache || null;
         const categoryPath = classifyTargetPath(id, cfg);
-        const catCid = await ensureFolderPath(cfg.target_cid, categoryPath);
+        const catCid = await ensureFolderPath(cfg.target_cid, categoryPath, cache);
         let targetFolderCid;
         if (id.mediaType === 'tv' || id.mediaType === 'anime') {
           const { showName, seasonName, episodeName } = generateTVNames(id, {}, item.season, item.episode, item.episode_end);
-          const showCid = await getOrCreateChildFolder(catCid, showName);
-          targetFolderCid = await getOrCreateChildFolder(showCid, seasonName);
+          const showCid = await getOrCreateChildFolder(catCid, showName, cache);
+          targetFolderCid = await getOrCreateChildFolder(showCid, seasonName, cache);
           const newName = episodeName + '.' + extOf(item.new_name || item.original_name);
           if (item.target_cid !== targetFolderCid) await moveFile(item.file_id, targetFolderCid);
           if (cfg.rename_enabled) await renameFile(item.file_id, newName);
         } else {
           const { folderName, fileName } = generateMovieNames(id, {});
-          targetFolderCid = await getOrCreateChildFolder(catCid, folderName);
+          targetFolderCid = await getOrCreateChildFolder(catCid, folderName, cache);
           const newName = fileName + '.' + extOf(item.new_name || item.original_name);
           if (item.target_cid !== targetFolderCid) await moveFile(item.file_id, targetFolderCid);
           if (cfg.rename_enabled) await renameFile(item.file_id, newName);
@@ -1035,6 +1103,7 @@ export async function resolveUnmatched(unmatchedId, payload) {
   if (!files.length) throw new Error('条目缺少文件信息，无法继续');
 
   const cfg = getConfig();
+  await attachTargetCache(cfg);
   const id = {
     title: payload.title || '',
     year: String(payload.year || ''),
@@ -1117,11 +1186,12 @@ async function processTVManual(group, id, cfg, taskId, stats, cancel, overrides,
   }
   if (!episodes.length) return;
 
+  const cache = cfg._targetCache || null;
   const categoryPath = classifyTargetPath(id, cfg);
-  const catCid = await ensureFolderPath(cfg.target_cid, categoryPath);
+  const catCid = await ensureFolderPath(cfg.target_cid, categoryPath, cache);
   const { showName } = generateTVNames(id, episodes[0].mediaInfo, episodes[0].season, episodes[0].episode);
-  const showCid = (await findExistingShowCid(id.tmdbId, id.mediaType, catCid))
-    ?? await getOrCreateChildFolder(catCid, showName);
+  const showCid = (await findExistingShowCid(id.tmdbId, id.mediaType, catCid, cache))
+    ?? await getOrCreateChildFolder(catCid, showName, cache);
   const seasonsCache = new Map();
 
   for (const ep of episodes) {
@@ -1129,7 +1199,7 @@ async function processTVManual(group, id, cfg, taskId, stats, cancel, overrides,
     let seasonCid = seasonsCache.get(ep.season);
     if (!seasonCid) {
       const { seasonName } = generateTVNames(id, ep.mediaInfo, ep.season, ep.episode, ep.episodeEnd);
-      seasonCid = await getOrCreateChildFolder(showCid, seasonName);
+      seasonCid = await getOrCreateChildFolder(showCid, seasonName, cache);
       seasonsCache.set(ep.season, seasonCid);
     }
     const { episodeName } = generateTVNames(id, ep.mediaInfo, ep.season, ep.episode, ep.episodeEnd);
@@ -1195,16 +1265,126 @@ async function cleanupEmptyFolders(rootCid) {
   const metaExts = new Set(parseExts(cfg?.meta_extensions, META_EXTS_DEFAULT));
   const isMedia = name => { const e = extOf(name); return videoExts.has(e) || metaExts.has(e); };
 
-  // 单次自下而上递归：每个目录只 listFolder 一次。返回该子树是否包含媒体文件。
+  try {
+    await cleanupEmptyFoldersFast(rootCid, isMedia);
+    return;
+  } catch (err) {
+    logger.warn('Organizer', `快速清理空目录失败，回退到逐目录递归: ${err.message}`);
+  }
+  await cleanupEmptyFoldersSlow(rootCid, isMedia);
+}
+
+// Fast path: one downfolders + one downfiles call reveal the entire subtree
+// shape and which folders contain files. Truly empty subtrees are deleted via
+// a single deleteFolder per top-level branch (server cascades children when
+// ignore_warn=1). Folders that contain files but possibly only non-media junk
+// fall back to a per-folder listFolder check (same semantics as the old code).
+async function cleanupEmptyFoldersFast(rootCid, isMedia) {
+  const rootStr = String(rootCid);
+  const info = await getFolderInfo(rootStr);
+  const pickcode = info?.pick_code || info?.pickcode || info?.data?.pick_code;
+  if (!pickcode) throw new Error('未取得根目录 pickcode');
+
+  const [folders, files] = await Promise.all([
+    listAllSubFolders(pickcode),
+    listAllSubFiles(pickcode),
+  ]);
+
+  const nodeById = new Map();
+  nodeById.set(rootStr, { name: `根目录#${rootStr}`, parentId: null, children: [], fileCount: 0, subtreeFiles: 0 });
+  for (const f of folders) {
+    const id = String(f.fid || f.cid || f.id || '');
+    if (!id) continue;
+    const name = String(f.fn || f.n || f.name || '');
+    const pid = String(f.pid || f.parent_id || rootStr);
+    nodeById.set(id, { name, parentId: pid, children: [], fileCount: 0, subtreeFiles: 0 });
+  }
+  for (const [id, node] of nodeById) {
+    if (id === rootStr) continue;
+    const parent = nodeById.get(node.parentId);
+    if (parent) parent.children.push(id);
+  }
+  for (const f of files) {
+    const pid = String(f.pid || f.parent_id || '');
+    const node = nodeById.get(pid);
+    if (node) node.fileCount++;
+  }
+  // Bottom-up roll-up
+  function rollup(id) {
+    const node = nodeById.get(id);
+    if (!node) return 0;
+    let n = node.fileCount;
+    for (const c of node.children) n += rollup(c);
+    node.subtreeFiles = n;
+    return n;
+  }
+  rollup(rootStr);
+
+  // Top-level empty branches (subtree has zero files AND parent has files or is root)
+  const emptyBranches = [];
+  const folderJunkCheck = [];
+  function visit(id, parentIsEmpty) {
+    const node = nodeById.get(id);
+    if (!node) return;
+    const isEmpty = node.subtreeFiles === 0;
+    if (id !== rootStr) {
+      if (isEmpty && !parentIsEmpty) {
+        emptyBranches.push({ id, parentId: node.parentId, name: node.name });
+      } else if (!isEmpty && node.fileCount > 0) {
+        folderJunkCheck.push({ id, parentId: node.parentId, name: node.name, depth: 0 });
+      }
+    }
+    for (const c of node.children) visit(c, isEmpty || parentIsEmpty);
+  }
+  visit(rootStr, false);
+
+  logger.info('Organizer', `[fast-cleanup] 树规模: ${nodeById.size - 1} 目录 / ${files.length} 文件; 待删空分支: ${emptyBranches.length}; 待核查含文件目录: ${folderJunkCheck.length}`);
+
+  for (const b of emptyBranches) {
+    logger.info('Organizer', `删除空文件夹分支: ${b.name} cid=${b.id}`);
+    try {
+      await deleteFolder(b.id, b.parentId);
+    } catch (err) {
+      logger.warn('Organizer', `删除失败: ${b.name} cid=${b.id} - ${err.message}`);
+    }
+  }
+
+  // depth bottom-up for junk check
+  function computeDepth(id) {
+    let d = 0, cur = id;
+    while (cur && cur !== rootStr) {
+      cur = nodeById.get(cur)?.parentId;
+      d++;
+      if (d > 64) break;
+    }
+    return d;
+  }
+  for (const j of folderJunkCheck) j.depth = computeDepth(j.id);
+  folderJunkCheck.sort((a, b) => b.depth - a.depth);
+  for (const j of folderJunkCheck) {
+    try {
+      const items = await listFolder(j.id);
+      const hasMedia = items.some(it => !it.isFolder && isMedia(it.name));
+      const hasFolder = items.some(it => it.isFolder);
+      if (!hasMedia && !hasFolder) {
+        logger.info('Organizer', `删除仅含非媒体文件的文件夹: ${j.name} cid=${j.id}`);
+        await deleteFolder(j.id, j.parentId);
+      }
+    } catch (err) {
+      logger.warn('Organizer', `核查/删除失败: ${j.name} cid=${j.id} - ${err.message}`);
+    }
+  }
+}
+
+async function cleanupEmptyFoldersSlow(rootCid, isMedia) {
   async function walk(cid, parentCid, name) {
     let items;
     try {
       items = await listFolder(cid);
     } catch (err) {
       logger.warn('Organizer', `空文件夹清理：列目录失败 ${name || ''} cid=${cid}`, err.message);
-      return true; // 列举失败时保守认为非空，不删
+      return true;
     }
-
     let hasMedia = false;
     for (const it of items) {
       if (it.isFolder) {
@@ -1214,7 +1394,6 @@ async function cleanupEmptyFolders(rootCid) {
         hasMedia = true;
       }
     }
-
     if (parentCid != null && !hasMedia) {
       logger.info('Organizer', `删除无媒体子文件夹: ${name} cid=${cid}`);
       try {
@@ -1225,6 +1404,5 @@ async function cleanupEmptyFolders(rootCid) {
     }
     return hasMedia;
   }
-
   await walk(String(rootCid), null, `根目录#${rootCid}`);
 }

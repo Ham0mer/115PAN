@@ -251,11 +251,38 @@ export async function getFileInfo(fileId) {
   return fetch115Api(url);
 }
 
-export async function renameFile(fileId, newName) {
+// Batch rename. pairs: [[fileId, newName], ...] or [{id|fileId, name|newName}, ...]
+export async function renameFiles(pairs) {
+  const norm = (pairs || [])
+    .map(p => Array.isArray(p) ? p : [p.id ?? p.fileId, p.name ?? p.newName])
+    .filter(([id, name]) => id && name);
+  if (!norm.length) return null;
   const url = 'https://webapi.115.com/files/batch_rename';
-  // 115 batch_rename takes files_new_name[FID]=NEWNAME
   const body = new URLSearchParams();
-  body.append(`files_new_name[${fileId}]`, newName);
+  for (const [id, name] of norm) body.append(`files_new_name[${id}]`, name);
+  const res = await fetch115Api(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: body.toString(),
+  });
+  await sleep(WRITE_OP_DELAY_MS);
+  return res;
+}
+
+export async function renameFile(fileId, newName) {
+  return renameFiles([[fileId, newName]]);
+}
+
+// Batch move. fileIds: string|string[]; all files go to the same target cid.
+export async function moveFiles(fileIds, targetCid) {
+  const ids = (Array.isArray(fileIds) ? fileIds : [fileIds])
+    .map(v => v == null ? '' : String(v))
+    .filter(Boolean);
+  if (!ids.length) return null;
+  const url = 'https://webapi.115.com/files/move';
+  const body = new URLSearchParams();
+  ids.forEach((id, i) => body.append(`fid[${i}]`, id));
+  body.append('pid', String(targetCid));
   const res = await fetch115Api(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -266,17 +293,7 @@ export async function renameFile(fileId, newName) {
 }
 
 export async function moveFile(fileId, targetCid) {
-  const url = 'https://webapi.115.com/files/move';
-  const body = new URLSearchParams();
-  body.append('fid[0]', String(fileId));
-  body.append('pid', String(targetCid));
-  const res = await fetch115Api(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: body.toString(),
-  });
-  await sleep(WRITE_OP_DELAY_MS);
-  return res;
+  return moveFiles([fileId], targetCid);
 }
 
 export async function createFolder(parentCid, folderName) {
@@ -294,10 +311,15 @@ export async function createFolder(parentCid, folderName) {
   return { cid: String(cid), name: folderName, raw: data };
 }
 
-export async function moveToRecycle(fileId) {
+// Batch recycle. fileIds: string|string[].
+export async function moveToRecycleBatch(fileIds) {
+  const ids = (Array.isArray(fileIds) ? fileIds : [fileIds])
+    .map(v => v == null ? '' : String(v))
+    .filter(Boolean);
+  if (!ids.length) return null;
   const url = 'https://webapi.115.com/rb/delete';
   const body = new URLSearchParams();
-  body.append('fid[0]', String(fileId));
+  ids.forEach((id, i) => body.append(`fid[${i}]`, id));
   const res = await fetch115Api(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -305,6 +327,10 @@ export async function moveToRecycle(fileId) {
   });
   await sleep(WRITE_OP_DELAY_MS);
   return res;
+}
+
+export async function moveToRecycle(fileId) {
+  return moveToRecycleBatch([fileId]);
 }
 
 export async function deleteFile(fileId) {
@@ -346,30 +372,114 @@ export async function getFolderPath(cid) {
   return fetch115Api(url);
 }
 
+function sanitizeSegment(seg) {
+  return String(seg ?? '').replace(/[\/\\:*?"<>|]/g, '').trim();
+}
+
 // Find a folder by name under parent; return the folder's cid or null.
-export async function findFolderByName(parentCid, name) {
+// Optional `cache` skips the API call when present.
+export async function findFolderByName(parentCid, name, cache = null) {
   if (!name) return null;
+  if (cache) {
+    const hit = cache.child(parentCid, name);
+    if (hit) return hit;
+  }
   const folders = await listFolder(parentCid, { onlyFolders: true });
   const hit = folders.find(f => f.name === name);
   return hit ? hit.id : null;
 }
 
 // Get or create a chain of folders. segments: ['电影', '国产', '2023'] => returns final cid.
-export async function ensureFolderPath(parentCid, segments) {
+// If `cache` is provided, existing folders are resolved from memory and only missing
+// segments cause a createFolder call; the cache is updated as new folders are created.
+export async function ensureFolderPath(parentCid, segments, cache = null) {
   let cid = String(parentCid);
-  for (const seg of segments) {
-    if (!seg) continue;
-    const safe = String(seg).replace(/[\/\\:*?"<>|]/g, '').trim();
-    if (!safe) continue;
-    const existing = await findFolderByName(cid, safe);
-    if (existing) {
-      cid = existing;
-    } else {
-      const created = await createFolder(cid, safe);
+  if (cache) {
+    const { cid: startCid, remaining } = cache.resolvePath(cid, segments);
+    cid = startCid;
+    for (const seg of remaining) {
+      const created = await createFolder(cid, seg);
+      cache.add(cid, seg, created.cid);
       cid = created.cid;
     }
+    return cid;
+  }
+  for (const seg of segments) {
+    const safe = sanitizeSegment(seg);
+    if (!safe) continue;
+    const existing = await findFolderByName(cid, safe);
+    cid = existing ? existing : (await createFolder(cid, safe)).cid;
   }
   return cid;
+}
+
+// In-memory mirror of a 115 folder subtree, populated via the bulk
+// /files/downfolders endpoint. Lets ensureFolderPath / findFolderByName
+// resolve known paths without any API call.
+export class FolderTreeCache {
+  constructor(rootCid) {
+    this.rootCid = String(rootCid);
+    // cid -> { name, parentId, children: Map<sanitizedName, cid> }
+    this.byId = new Map();
+    this.byId.set(this.rootCid, { name: '', parentId: null, children: new Map() });
+  }
+
+  async load() {
+    const info = await getFolderInfo(this.rootCid);
+    const pickcode = String(
+      pickField(info, 'pick_code', 'pickcode', 'pc') ||
+      pickField(info?.data || {}, 'pick_code', 'pickcode', 'pc') || ''
+    );
+    if (!pickcode) throw new Error(`FolderTreeCache: 未取得根 cid=${this.rootCid} 的 pickcode`);
+    const folders = await listAllSubFolders(pickcode);
+    for (const f of folders) {
+      const id = String(pickField(f, 'fid', 'cid', 'id') || '');
+      const name = String(pickField(f, 'fn', 'n', 'name') || '');
+      const pid = String(pickField(f, 'pid', 'parent_id', 'cpid') || this.rootCid);
+      if (!id) continue;
+      this.byId.set(id, { name, parentId: pid, children: new Map() });
+    }
+    for (const [id, node] of this.byId) {
+      if (id === this.rootCid) continue;
+      const parent = this.byId.get(node.parentId);
+      if (parent) parent.children.set(node.name, id);
+    }
+    logger.debug('115', `FolderTreeCache loaded root=${this.rootCid} folders=${this.byId.size - 1}`);
+    return this;
+  }
+
+  child(parentCid, name) {
+    const safe = sanitizeSegment(name);
+    if (!safe) return undefined;
+    const node = this.byId.get(String(parentCid));
+    if (!node) return undefined;
+    return node.children.get(name) || node.children.get(safe);
+  }
+
+  add(parentCid, name, cid) {
+    const pid = String(parentCid);
+    const id = String(cid);
+    const safe = sanitizeSegment(name) || String(name);
+    this.byId.set(id, { name: safe, parentId: pid, children: new Map() });
+    const parent = this.byId.get(pid);
+    if (parent) parent.children.set(safe, id);
+  }
+
+  // Resolve as many segments as possible from cache. Returns the cid reached
+  // and the remaining segments that need to be created.
+  resolvePath(parentCid, segments) {
+    let cid = String(parentCid);
+    const segs = (segments || []).map(sanitizeSegment).filter(Boolean);
+    for (let i = 0; i < segs.length; i++) {
+      const c = this.child(cid, segs[i]);
+      if (c) {
+        cid = c;
+      } else {
+        return { cid, remaining: segs.slice(i) };
+      }
+    }
+    return { cid, remaining: [] };
+  }
 }
 
 // ----- Share link transfer -----
@@ -445,7 +555,23 @@ export async function transferShareLink(link, targetCid = '0') {
 }
 
 // List videos / metas recursively. maxDepth guards against pathological structures.
+// Tries the fast bulk-tree API first (proapi.115.com /app/chrome/downfolders + downfiles,
+// inspired by p115client.iter_dirs_with_path) and falls back to per-folder paging on failure
+// or when listing the user's root (cid=0 has no pickcode).
 export async function listFilesRecursive(rootCid, { maxDepth = 8, onItem } = {}) {
+  const cidStr = String(rootCid);
+  if (cidStr !== '0') {
+    try {
+      const fast = await listFilesRecursiveFast(cidStr, { maxDepth, onItem });
+      if (fast) return fast;
+    } catch (err) {
+      logger.warn('115', `快速扫描失败，回退到逐目录翻页: ${err.message}`);
+    }
+  }
+  return listFilesRecursiveSlow(cidStr, { maxDepth, onItem });
+}
+
+async function listFilesRecursiveSlow(rootCid, { maxDepth = 8, onItem } = {}) {
   const result = [];
   async function walk(cid, depth, pathSegs) {
     if (depth > maxDepth) return;
@@ -465,5 +591,128 @@ export async function listFilesRecursive(rootCid, { maxDepth = 8, onItem } = {})
     }
   }
   await walk(String(rootCid), 0, []);
+  return result;
+}
+
+// ----- Fast bulk tree listing via 115 download-manager API -----
+
+// Get folder metadata (incl. pick_code) for a non-root cid.
+export async function getFolderInfo(cid) {
+  const ts = Date.now();
+  const url = `https://webapi.115.com/category/get?cid=${encodeURIComponent(cid)}&_t=${ts}`;
+  return fetch115Api(url);
+}
+
+function pickField(obj, ...keys) {
+  for (const k of keys) {
+    const v = obj?.[k];
+    if (v !== undefined && v !== null && v !== '') return v;
+  }
+  return undefined;
+}
+
+// Paginated GET against /app/chrome/downfolders or /app/chrome/downfiles.
+// Returns the flat list of raw items across all pages.
+async function fetchAllPages(endpoint, pickcode) {
+  const all = [];
+  let page = 1;
+  const perPage = 5000;
+  while (true) {
+    const url = `https://webapi.115.com/files/${endpoint}?pickcode=${encodeURIComponent(pickcode)}&page=${page}&per_page=${perPage}`;
+    const data = await fetch115Api(url);
+    const list = Array.isArray(data?.data?.list) ? data.data.list
+      : Array.isArray(data?.list) ? data.list
+      : Array.isArray(data?.data) ? data.data
+      : [];
+    if (list.length) all.push(...list);
+    const hasNext = pickField(data?.data || {}, 'has_next_page') ?? pickField(data, 'has_next_page');
+    const count = Number(pickField(data?.data || {}, 'count', 'total') ?? pickField(data, 'count', 'total') ?? 0);
+    if (list.length < perPage) {
+      if (hasNext === true) {
+        page += 1;
+        await sleep(getOpDelayMs());
+        continue;
+      }
+      break;
+    }
+    if (count && all.length >= count) break;
+    page += 1;
+    await sleep(getOpDelayMs());
+  }
+  return all;
+}
+
+export async function listAllSubFolders(pickcode) {
+  return fetchAllPages('downfolders', pickcode);
+}
+
+export async function listAllSubFiles(pickcode) {
+  return fetchAllPages('downfiles', pickcode);
+}
+
+// Bulk tree walker. Two paginated calls (folders + files) plus one /category/get for root,
+// then path reconstruction in-memory via parent_id. Returns same shape as listFilesRecursiveSlow.
+export async function listFilesRecursiveFast(rootCid, { maxDepth = 8, onItem } = {}) {
+  const cidStr = String(rootCid);
+  const rootInfo = await getFolderInfo(cidStr);
+  const rootPickcode = String(
+    pickField(rootInfo, 'pick_code', 'pickcode', 'pc') ||
+    pickField(rootInfo?.data || {}, 'pick_code', 'pickcode', 'pc') || ''
+  );
+  if (!rootPickcode) throw new Error('未取得根目录 pickcode');
+
+  const [rawFolders, rawFiles] = await Promise.all([
+    listAllSubFolders(rootPickcode),
+    listAllSubFiles(rootPickcode),
+  ]);
+  logger.debug('115', `bulk tree cid=${cidStr} → ${rawFolders.length} 文件夹 + ${rawFiles.length} 文件`);
+
+  // Build dir tree: id -> { name, parentId }
+  const dirById = new Map();
+  dirById.set(cidStr, { name: '', parentId: null });
+  for (const f of rawFolders) {
+    const id = String(pickField(f, 'fid', 'cid', 'id') || '');
+    const name = String(pickField(f, 'fn', 'n', 'name') || '');
+    const pid = String(pickField(f, 'pid', 'parent_id', 'cpid') || '');
+    if (!id) continue;
+    dirById.set(id, { name, parentId: pid || cidStr });
+  }
+
+  function ancestorsOf(id) {
+    const segs = [];
+    let cur = id;
+    let safety = 64;
+    while (cur && cur !== cidStr && safety-- > 0) {
+      const node = dirById.get(cur);
+      if (!node) break;
+      segs.unshift(node.name);
+      cur = node.parentId;
+    }
+    return segs;
+  }
+
+  const result = [];
+  for (const f of rawFiles) {
+    const id = String(pickField(f, 'fid', 'file_id', 'id') || '');
+    const name = String(pickField(f, 'fn', 'n', 'file_name', 'name') || '');
+    const size = Number(pickField(f, 'fs', 's', 'size', 'file_size') || 0);
+    const pid = String(pickField(f, 'pid', 'parent_id', 'cpid') || cidStr);
+    if (!id || !name) continue;
+    const pathSegs = ancestorsOf(pid);
+    const depth = pathSegs.length;
+    if (depth > maxDepth) continue;
+    const entry = {
+      id,
+      name,
+      isFolder: false,
+      size,
+      parentCid: pid,
+      raw: f,
+      depth,
+      pathSegs,
+    };
+    result.push(entry);
+    if (onItem) onItem(entry);
+  }
   return result;
 }

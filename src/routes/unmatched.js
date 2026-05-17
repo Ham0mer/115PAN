@@ -7,7 +7,7 @@ import { parseFilename } from '../services/parser.js';
 import { aiIdentify } from '../services/ai.js';
 import { searchMulti, searchMovie, searchTV, getMovieDetails, getTVDetails, findByImdbId, isAnime, getYear, getTitle } from '../services/tmdb.js';
 import { resolveUnmatched } from '../services/organizer.js';
-import { moveToRecycle } from '../services/115.js';
+import { moveToRecycleBatch } from '../services/115.js';
 import { generateThumbnail } from '../services/ffprobe.js';
 
 export const unmatchedRouter = Router();
@@ -188,9 +188,10 @@ unmatchedRouter.delete('/:id', async (req, res) => {
     if (!item) return res.status(404).json({ error: '条目不存在' });
     const files = JSON.parse(item.file_ids || '[]');
     const errors = [];
-    for (const f of files) {
-      try { await moveToRecycle(f.id); }
-      catch (err) { errors.push({ file: f.name, error: err.message }); }
+    const ids = files.map(f => f.id).filter(Boolean);
+    if (ids.length) {
+      try { await moveToRecycleBatch(ids); }
+      catch (err) { errors.push({ file: files.map(f => f.name).join(','), error: err.message }); }
     }
     // Clean up thumbnail
     if (item.thumbnail_path && fs.existsSync(item.thumbnail_path)) {
@@ -264,8 +265,9 @@ unmatchedRouter.post('/batch/delete', async (req, res) => {
       const item = db.prepare('SELECT * FROM unmatched_items WHERE id=?').get(id);
       if (!item) continue;
       const files = JSON.parse(item.file_ids || '[]');
-      for (const f of files) {
-        try { await moveToRecycle(f.id); } catch {}
+      const fileIds = files.map(f => f.id).filter(Boolean);
+      if (fileIds.length) {
+        try { await moveToRecycleBatch(fileIds); } catch {}
       }
       db.prepare("UPDATE unmatched_items SET status='resolved', updated_at=datetime('now','localtime') WHERE id=?").run(id);
       results.push({ id, ok: true });
