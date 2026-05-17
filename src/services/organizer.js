@@ -400,12 +400,21 @@ function pickBestTmdb(results, info) {
 async function processGroup(group, cfg, taskId, stats, cancel, episodeSummary) {
   const id = await identifyGroup(group, cfg);
 
-  // Push to unmatched if required fields missing
-  const baseRequired = id.title && id.year && id.tmdbId;
-  if (!baseRequired) {
-    await pushUnmatched(group, id, '缺少必要字段 (title/year/tmdbId)');
+  // 只有 title 是硬性要求；year/tmdbId 缺失时让下游按空值继续走流程。
+  if (!id.title) {
+    await pushUnmatched(group, id, '缺少必要字段 (title)');
     stats.skip++;
     return;
+  }
+  //使用title调用tmdb接口：缺tmdbId补齐tmdbId，缺失year的，补齐year
+  if (!id.tmdbId || !id.year) {
+    const tmdb = await resolveViaTmdb({ ...id, year: '' });
+    if (tmdb) {
+      if (!id.tmdbId && tmdb.tmdbId) id.tmdbId = tmdb.tmdbId;
+      if (!id.year && tmdb.year) id.year = tmdb.year;
+      if (tmdb.tmdbDetails && !id.tmdbDetails) id.tmdbDetails = tmdb.tmdbDetails;
+      if (tmdb.mediaType && !id.mediaType) id.mediaType = tmdb.mediaType;
+    }
   }
 
   if (id.mediaType === 'tv' || id.mediaType === 'anime') {
