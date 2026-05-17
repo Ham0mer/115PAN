@@ -1,5 +1,7 @@
 import { Router } from 'express';
-import { fetchQrToken, fetchQrStatus, fetchQrLoginResult, fetch115UserInfo, saveCookie, getActiveCookie, listFolders, verifyCookie, expireCookie, parseShareLink, fetchShareSnap, transferShareLink } from '../services/115.js';
+import { fetchQrToken, fetchQrStatus, fetchQrLoginResult, fetch115UserInfo, saveCookie, getActiveCookie, listFolders, verifyCookie, expireCookie, parseShareLink, fetchShareSnap, transferShareLink, addOfflineUrls } from '../services/115.js';
+import { getDb } from '../services/db.js';
+import { extractOfflineLinks } from '../services/offline-links.js';
 import { logger } from '../services/logger.js';
 
 export const router115 = Router();
@@ -120,6 +122,37 @@ router115.post('/share/parse', async (req, res) => {
       receiveCode: parsed.receiveCode,
       shareInfo,
       files: list.map(f => ({ id: String(f.fid || f.cid), name: f.n, size: Number(f.s || 0), isFolder: !f.fid })),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Offline download: extract links from raw text and add as tasks
+// 保存目录复用 config_organize.source_cid（下载完成后即被整理流程接管）
+router115.post('/offline/add', async (req, res) => {
+  try {
+    const { text, urls, targetCid: bodyCid } = req.body || {};
+    let list;
+    if (Array.isArray(urls) && urls.length) {
+      list = urls.map(u => String(u || '').trim()).filter(Boolean);
+    } else {
+      list = extractOfflineLinks(String(text || ''));
+    }
+    if (!list.length) return res.status(400).json({ error: '未识别到有效链接' });
+    if (!getActiveCookie()) return res.status(401).json({ error: '未登录115账号' });
+    const org = getDb().prepare('SELECT source_cid, source_name FROM config_organize WHERE id=1').get();
+    // 用户显式传入 targetCid 优先；缺省时回退到 source_cid
+    const targetCid = (bodyCid != null && String(bodyCid).trim() !== '') ? String(bodyCid) : (org?.source_cid || '');
+    if (!targetCid) return res.status(400).json({ error: '未指定保存目录，且未配置待整理目录 (config_organize.source_cid)' });
+    const result = await addOfflineUrls(list, targetCid);
+    res.json({
+      success: true,
+      count: list.length,
+      urls: list,
+      targetCid,
+      targetName: org?.source_name || '',
+      result,
     });
   } catch (err) {
     res.status(500).json({ error: err.message });

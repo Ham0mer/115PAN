@@ -113,7 +113,8 @@ unmatchedRouter.post('/:id/retry', async (req, res) => {
         id.tmdbId = best.id;
         id.title = getTitle(detail || best) || id.title;
         id.year = getYear(detail || best) || id.year;
-        id.mediaType = isAnime(detail || best) ? 'anime' : best.media_type;
+        // 仅允许 tv → anime；动画电影应继续按电影处理
+        id.mediaType = (best.media_type === 'tv' && isAnime(detail || best)) ? 'anime' : best.media_type;
         id.tmdbCandidates = results.slice(0, 5).map(r => ({
           id: r.id, title: r.title || r.name, year: (r.release_date || r.first_air_date || '').slice(0,4), media_type: r.media_type,
         }));

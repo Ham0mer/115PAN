@@ -86,6 +86,34 @@ registerPage('dashboard', async (container) => {
         <div id="share-output" style="font-size:13px;color:#9aa9b9;margin-top:12px;"></div>
       </div>
 
+      <div class="card mt-16">
+        <div class="card-header">添加离线任务</div>
+        <div class="form-group">
+          <label>下载链接（支持 HTTP/HTTPS/FTP/磁力链/电驴，可一次粘贴多条）</label>
+          <textarea id="offline-urls-input" rows="4" placeholder="https://example.com/foo.mkv&#10;magnet:?xt=urn:btih:..." style="width:100%;font-family:monospace;font-size:13px"></textarea>
+        </div>
+        <div class="form-group">
+          <label>保存到</label>
+          <div style="display:flex;gap:8px;align-items:center">
+            <input type="text" id="offline-target-name" readonly placeholder="待整理目录（默认）" style="flex:1">
+            <input type="hidden" id="offline-target-cid" value="">
+            <button type="button" class="btn btn-sm" id="btn-offline-pick">选择目录</button>
+          </div>
+        </div>
+        <div style="display:flex;gap:8px;align-items:center">
+          <button class="btn btn-primary btn-sm" id="btn-offline-submit">提交</button>
+          <span id="offline-detected" style="font-size:12px;color:var(--text-tertiary)"></span>
+        </div>
+        <div id="offline-output" style="font-size:13px;color:#9aa9b9;margin-top:12px;"></div>
+      </div>
+
+      <div id="offline-picker-modal" class="modal-overlay" style="display:none">
+        <div class="modal">
+          <div class="modal-header"><h3>选择保存目录</h3><button class="btn btn-sm" id="btn-offline-picker-close">✕</button></div>
+          <div id="offline-picker-content" style="max-height:400px;overflow-y:auto"></div>
+        </div>
+      </div>
+
       <div id="share-picker-modal" class="modal-overlay" style="display:none">
         <div class="modal">
           <div class="modal-header"><h3>选择转存目录</h3><button class="btn btn-sm" id="btn-share-picker-close">✕</button></div>
@@ -102,6 +130,7 @@ registerPage('dashboard', async (container) => {
     });
 
     bindShareTransfer();
+    bindOfflineAdd();
 
     const parseInput = document.getElementById('parse-test-input');
     const parseOut = document.getElementById('parse-test-output');
@@ -222,6 +251,118 @@ function bindShareTransfer() {
     } catch (err) {
       output.innerHTML = `<span class="error-msg">转存失败: ${escHtml(err.message)}</span>`;
       showToast(err.message, 'error');
+    }
+  });
+}
+
+function bindOfflineAdd() {
+  const input = document.getElementById('offline-urls-input');
+  const detected = document.getElementById('offline-detected');
+  const output = document.getElementById('offline-output');
+  const btn = document.getElementById('btn-offline-submit');
+  const targetCid = document.getElementById('offline-target-cid');
+  const targetName = document.getElementById('offline-target-name');
+  const modal = document.getElementById('offline-picker-modal');
+  const pickerContent = document.getElementById('offline-picker-content');
+
+  // 与后端 services/offline-links.js 保持一致的提取逻辑
+  const URL_PATTERNS = [
+    /https?:\/\/\S+/gi,
+    /ftp:\/\/\S+/gi,
+    /magnet:\?[^\s]+/gi,
+    /ed2k:\/\/\|[^\s]+\|\//gi,
+  ];
+  const SHARE_HOST_RE = /^https?:\/\/(?:115|115cdn|anxia)\.com\/s\//i;
+  function extractLinks(text) {
+    if (!text) return [];
+    const seen = new Set();
+    const out = [];
+    for (const re of URL_PATTERNS) {
+      const matches = String(text).match(re) || [];
+      for (let m of matches) {
+        m = m.replace(/[)\]，。；,;.'"`>}】）]+$/u, '');
+        if (!m || SHARE_HOST_RE.test(m) || seen.has(m)) continue;
+        seen.add(m); out.push(m);
+      }
+    }
+    return out;
+  }
+  function escHtml(s) {
+    return String(s).replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
+  }
+
+  // 与 bindShareTransfer 中的 loadPicker 结构一致，区别仅是绑定的目标输入框
+  async function loadPicker(cid, currentName) {
+    pickerContent.innerHTML = '<p>加载中...</p>';
+    try {
+      const folders = await API.get(`/api/115/folders?cid=${encodeURIComponent(cid)}`);
+      let html = '';
+      if (cid !== '0') {
+        html += '<button class="btn btn-sm" style="margin-bottom:4px" data-back="0">📁 根目录</button> ';
+        html += `<button class="btn btn-primary btn-sm" style="margin-bottom:8px" data-select="${cid}">✅ 选择此目录${currentName ? '：' + escHtml(currentName) : ''}</button>`;
+      } else {
+        html += `<button class="btn btn-primary btn-sm" style="margin-bottom:8px" data-select="0">✅ 选择根目录</button>`;
+        html += '<p style="color:var(--text-tertiary);margin-bottom:8px;font-size:13px">点击文件夹进入子目录</p>';
+      }
+      if (folders.length === 0) {
+        html += '<p style="color:var(--text-tertiary)">此目录下没有子文件夹</p>';
+      } else {
+        folders.forEach(f => {
+          html += `<button class="btn btn-sm" style="margin:2px;display:block;width:100%;text-align:left" data-nav="${f.cid}" data-name="${escHtml(f.name)}">📁 ${escHtml(f.name)}</button>`;
+        });
+      }
+      pickerContent.innerHTML = html;
+      const selectBtn = pickerContent.querySelector('[data-select]');
+      if (selectBtn) {
+        selectBtn.addEventListener('click', () => {
+          targetCid.value = cid;
+          targetName.value = cid === '0' ? '根目录' : (currentName || cid);
+          modal.style.display = 'none';
+        });
+      }
+      const backBtn = pickerContent.querySelector('[data-back]');
+      if (backBtn) backBtn.addEventListener('click', () => loadPicker('0'));
+      pickerContent.querySelectorAll('button[data-nav]').forEach(b => {
+        b.addEventListener('click', () => loadPicker(b.dataset.nav, b.dataset.name));
+      });
+    } catch (err) {
+      pickerContent.innerHTML = `<p class="error-msg">加载失败: ${escHtml(err.message)}</p>`;
+    }
+  }
+
+  document.getElementById('btn-offline-pick').addEventListener('click', () => {
+    modal.style.display = '';
+    loadPicker('0');
+  });
+  document.getElementById('btn-offline-picker-close').addEventListener('click', () => {
+    modal.style.display = 'none';
+  });
+
+  input.addEventListener('input', () => {
+    const links = extractLinks(input.value);
+    detected.textContent = links.length ? `检测到 ${links.length} 个链接` : '';
+  });
+
+  btn.addEventListener('click', async () => {
+    const links = extractLinks(input.value);
+    if (!links.length) { showToast('未识别到有效链接', 'error'); return; }
+    output.innerHTML = '提交中...';
+    btn.disabled = true;
+    try {
+      const body = { urls: links };
+      // 空 targetCid 时由后端回退到 source_cid（待整理目录）
+      if (targetCid.value) body.targetCid = targetCid.value;
+      const data = await API.post('/api/115/offline/add', body);
+      const where = targetCid.value ? (targetName.value || data.targetCid) : (data.targetName || '待整理目录');
+      output.innerHTML = `<span class="text-success">✅ 已提交 ${data.count} 个任务 → ${escHtml(where)}</span>`;
+      showToast('离线任务已添加', 'success');
+      input.value = '';
+      detected.textContent = '';
+    } catch (err) {
+      output.innerHTML = `<span class="error-msg">提交失败: ${escHtml(err.message)}</span>`;
+      showToast(err.message, 'error');
+    } finally {
+      btn.disabled = false;
     }
   });
 }

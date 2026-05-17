@@ -1,6 +1,7 @@
 import { getDb } from './db.js';
 import { logger } from './logger.js';
-import { parseShareLink, fetchShareSnap, transferShareLink, listFolders, getActiveCookie } from './115.js';
+import { parseShareLink, fetchShareSnap, transferShareLink, listFolders, getActiveCookie, addOfflineUrls } from './115.js';
+import { extractOfflineLinks } from './offline-links.js';
 
 // Telegram Bot API 根地址
 const TG_API = 'https://api.telegram.org';
@@ -130,8 +131,10 @@ async function showPicker(cfg, state) {
   }
 
   // 确认按钮：把当前所处的位置作为目标
+  const isOffline = state.type === 'offline';
   const hereName = state.breadcrumb.length ? state.breadcrumb[state.breadcrumb.length - 1].name : '根目录';
-  keyboard.push([{ text: `✅ 转存到此处 (${hereName})`, callback_data: `s:${state.token}` }]);
+  const confirmLabel = isOffline ? `✅ 添加到此处 (${hereName})` : `✅ 转存到此处 (${hereName})`;
+  keyboard.push([{ text: confirmLabel, callback_data: `s:${state.token}` }]);
 
   // 快捷按钮：直达"待整理目录"。仅当配置了 source_cid 且不与当前位置相同时显示
   if (state.sourceCid && state.sourceCid !== state.currentCid) {
@@ -143,11 +146,14 @@ async function showPicker(cfg, state) {
 
   // 面包屑路径展示
   const breadcrumbStr = state.breadcrumb.length === 0 ? '/' : '/' + state.breadcrumb.map(b => b.name).join('/');
-  const text =
-    `📦 <b>分享转存</b>\n` +
-    (state.shareTitle ? `分享: ${htmlEscape(state.shareTitle)}\n` : '') +
-    `共 ${state.fileCount} 项\n\n` +
-    `当前位置: <code>${htmlEscape(breadcrumbStr)}</code>`;
+  const text = isOffline
+    ? `🧲 <b>添加离线任务</b>\n` +
+      `共 ${state.fileCount} 个链接\n\n` +
+      `当前位置: <code>${htmlEscape(breadcrumbStr)}</code>`
+    : `📦 <b>分享转存</b>\n` +
+      (state.shareTitle ? `分享: ${htmlEscape(state.shareTitle)}\n` : '') +
+      `共 ${state.fileCount} 项\n\n` +
+      `当前位置: <code>${htmlEscape(breadcrumbStr)}</code>`;
 
   await safeEdit(cfg.bot_token, {
     chat_id: state.chatId,
@@ -233,6 +239,86 @@ async function handleShareLink(cfg, chatId, link) {
     await safeEdit(cfg.bot_token, {
       chat_id: chatId, message_id: wait.message_id,
       text: `❌ 加载目录失败: ${htmlEscape(err.message)}`, parse_mode: 'HTML',
+    }).catch(() => {});
+  }
+}
+
+/**
+ * 处理用户消息中提取到的离线下载链接：
+ * 1) 校验 Cookie；
+ * 2) 直接打开目录选择器（与分享转存一致），让用户选保存目录；
+ * 3) 用户在选择器里点"添加到此处"/"待整理目录"由 handleCallback 的 s/q 分支
+ *    根据 state.type==='offline' 走 doOfflineAdd。
+ */
+async function handleOfflineLinks(cfg, chatId, links) {
+  if (!getActiveCookie()) {
+    await tgApi(cfg.bot_token, 'sendMessage', {
+      chat_id: chatId, text: '⚠️ 未登录 115 账号，请先在控制台扫码登录。',
+    }).catch(() => {});
+    return;
+  }
+
+  // 先发占位消息，picker 之后在原消息上 edit
+  const wait = await tgApi(cfg.bot_token, 'sendMessage', {
+    chat_id: chatId, text: `🧲 检测到 ${links.length} 个链接，加载目录中...`,
+  }).catch(() => null);
+  if (!wait) return;
+
+  const org = getDb().prepare('SELECT source_cid, source_name FROM config_organize WHERE id=1').get();
+  const token = newToken();
+  const state = {
+    token,
+    type: 'offline',
+    botId: cfg.id,
+    chatId: String(chatId),
+    messageId: wait.message_id,
+    links,
+    fileCount: links.length,   // 复用 showPicker 的 fileCount 字段
+    currentCid: '0',
+    breadcrumb: [],
+    pickerOffset: 0,
+    sourceCid: org?.source_cid || '',
+    sourceName: org?.source_name || '',
+    createdAt: Date.now(),
+  };
+  states.set(token, state);
+
+  try {
+    await showPicker(cfg, state);
+  } catch (err) {
+    states.delete(token);
+    await safeEdit(cfg.bot_token, {
+      chat_id: chatId, message_id: wait.message_id,
+      text: `❌ 加载目录失败: ${htmlEscape(err.message)}`, parse_mode: 'HTML',
+    }).catch(() => {});
+  }
+}
+
+/**
+ * 执行离线任务提交。
+ * 中间态把消息改为"⏳ 提交中..."，完成后改为成功/失败。
+ */
+async function doOfflineAdd(cfg, state, targetCid, targetLabel) {
+  await safeEdit(cfg.bot_token, {
+    chat_id: state.chatId, message_id: state.messageId, text: '⏳ 提交中...',
+  }).catch(() => {});
+
+  try {
+    await addOfflineUrls(state.links, targetCid);
+    states.delete(state.token);
+    await safeEdit(cfg.bot_token, {
+      chat_id: state.chatId, message_id: state.messageId,
+      text:
+        `✅ <b>离线任务已添加</b>\n` +
+        `数量: ${state.links.length}\n` +
+        `目录: ${htmlEscape(targetLabel)}`,
+      parse_mode: 'HTML',
+    }).catch(() => {});
+    logger.info('TelegramBot', `离线任务已提交 chat=${state.chatId} count=${state.links.length} → ${targetCid}`);
+  } catch (err) {
+    await safeEdit(cfg.bot_token, {
+      chat_id: state.chatId, message_id: state.messageId,
+      text: `❌ 提交失败: ${htmlEscape(err.message)}`, parse_mode: 'HTML',
     }).catch(() => {});
   }
 }
@@ -329,7 +415,8 @@ async function handleCallback(cfg, q) {
     }
     if (action === 's') {
       const label = state.breadcrumb.length ? '/' + state.breadcrumb.map(b => b.name).join('/') : '根目录';
-      await doTransfer(cfg, state, state.currentCid, label);
+      if (state.type === 'offline') await doOfflineAdd(cfg, state, state.currentCid, label);
+      else await doTransfer(cfg, state, state.currentCid, label);
       return;
     }
     if (action === 'q') {
@@ -339,7 +426,9 @@ async function handleCallback(cfg, q) {
         }).catch(() => {});
         return;
       }
-      await doTransfer(cfg, state, state.sourceCid, state.sourceName || '待整理目录');
+      const label = state.sourceName || '待整理目录';
+      if (state.type === 'offline') await doOfflineAdd(cfg, state, state.sourceCid, label);
+      else await doTransfer(cfg, state, state.sourceCid, label);
       return;
     }
   } catch (err) {
@@ -362,9 +451,17 @@ async function handleUpdate(cfg, upd) {
     } else if (/^\/(start|help)/i.test(text.trim())) {
       await tgApi(cfg.bot_token, 'sendMessage', {
         chat_id: chatId,
-        text: '👋 发送 115 分享链接即可转存。\n格式: <code>https://115.com/s/&lt;code&gt;?password=&lt;code&gt;</code>',
+        text:
+          '👋 支持两种操作：\n' +
+          '1) 发送 115 分享链接 → 选目录转存\n' +
+          '   格式: <code>https://115.com/s/&lt;code&gt;?password=&lt;code&gt;</code>\n' +
+          '2) 发送下载链接（HTTP/HTTPS/FTP/磁力/电驴）→ 添加离线任务到「待整理目录」\n' +
+          '   可一次粘贴多条，会自动识别并请求确认。',
         parse_mode: 'HTML',
       }).catch(() => {});
+    } else {
+      const offline = extractOfflineLinks(text);
+      if (offline.length) await handleOfflineLinks(cfg, chatId, offline);
     }
   } else if (upd.callback_query) {
     const chatId = String(upd.callback_query.message?.chat?.id || '');

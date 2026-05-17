@@ -403,7 +403,8 @@ async function identifyGroup(group, cfg) {
     }
   }
   if (merged.tmdbDetails) {
-    if (isAnime(merged.tmdbDetails)) merged.mediaType = 'anime';
+    // 仅允许 tv → anime；动画电影应继续按电影处理（项目内 anime 流程强制要求 S/E）
+    if (merged.mediaType === 'tv' && isAnime(merged.tmdbDetails)) merged.mediaType = 'anime';
     const dy = getYear(merged.tmdbDetails);
     if (dy) merged.year = dy;
     const dt = getTitle(merged.tmdbDetails);
@@ -465,7 +466,8 @@ async function resolveViaTmdb(info) {
       const detail = best.media_type === 'movie'
         ? await getMovieDetails(best.id)
         : await getTVDetails(best.id);
-      const mediaType = isAnime(detail || best) ? 'anime' : best.media_type;
+      // 仅允许 tv → anime；动画电影应继续按电影处理
+      const mediaType = (best.media_type === 'tv' && isAnime(detail || best)) ? 'anime' : best.media_type;
       return {
         title: getTitle(detail || best) || info.title,
         year: getYear(detail || best) || info.year,
@@ -1242,7 +1244,8 @@ export async function rerunInPlace(originalTaskId) {
           if (id.tmdbDetails) {
             id.year = getYear(id.tmdbDetails);
             id.title = getTitle(id.tmdbDetails);
-            if (isAnime(id.tmdbDetails)) id.mediaType = 'anime';
+            // 仅允许 tv → anime；动画电影应继续按电影处理
+            if (id.mediaType === 'tv' && isAnime(id.tmdbDetails)) id.mediaType = 'anime';
           }
         }
         if (!id.title || !id.year || !id.tmdbId) { stats.skip++; continue; }
@@ -1315,7 +1318,8 @@ export async function resolveUnmatched(unmatchedId, payload) {
     if (id.tmdbDetails) {
       if (!id.title) id.title = getTitle(id.tmdbDetails);
       if (!id.year) id.year = getYear(id.tmdbDetails);
-      if (isAnime(id.tmdbDetails)) id.mediaType = 'anime';
+      // 仅允许 tv → anime；动画电影应继续按电影处理
+      if (id.mediaType === 'tv' && isAnime(id.tmdbDetails)) id.mediaType = 'anime';
     }
   }
   if (!id.title || !id.year || !id.tmdbId) throw new Error('必填字段缺失 (title/year/tmdbId)');
