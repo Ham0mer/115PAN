@@ -555,20 +555,12 @@ export async function transferShareLink(link, targetCid = '0') {
 }
 
 // List videos / metas recursively. maxDepth guards against pathological structures.
-// Tries the fast bulk-tree API first (proapi.115.com /app/chrome/downfolders + downfiles,
-// inspired by p115client.iter_dirs_with_path) and falls back to per-folder paging on failure
-// or when listing the user's root (cid=0 has no pickcode).
+// NOTE: downfiles doesn't return file names, so the bulk fast path is unusable for
+// source scanning. We keep the per-folder slow walker as the only implementation here.
+// listFilesRecursiveFast/listAllSubFiles remain exported for other callers but MUST NOT
+// be used when filenames are required.
 export async function listFilesRecursive(rootCid, { maxDepth = 8, onItem } = {}) {
-  const cidStr = String(rootCid);
-  if (cidStr !== '0') {
-    try {
-      const fast = await listFilesRecursiveFast(cidStr, { maxDepth, onItem });
-      if (fast) return fast;
-    } catch (err) {
-      logger.warn('115', `快速扫描失败，回退到逐目录翻页: ${err.message}`);
-    }
-  }
-  return listFilesRecursiveSlow(cidStr, { maxDepth, onItem });
+  return listFilesRecursiveSlow(String(rootCid), { maxDepth, onItem });
 }
 
 async function listFilesRecursiveSlow(rootCid, { maxDepth = 8, onItem } = {}) {

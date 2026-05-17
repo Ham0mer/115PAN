@@ -1275,11 +1275,13 @@ async function cleanupEmptyFolders(rootCid) {
 }
 
 // Fast path: one downfolders + one downfiles call reveal the entire subtree
-// shape and which folders contain files. Truly empty subtrees are deleted via
-// a single deleteFolder per top-level branch (server cascades children when
-// ignore_warn=1). Folders that contain files but possibly only non-media junk
-// fall back to a per-folder listFolder check (same semantics as the old code).
-async function cleanupEmptyFoldersFast(rootCid, isMedia) {
+// shape and which folders contain ANY file (downfiles' pid maps to downfolders'
+// fid). We delete only subtrees that contain zero files — one deleteFolder per
+// top-level empty branch (server cascades children with ignore_warn=1).
+// Folders that hold non-media junk are left alone here; that aggressive cleanup
+// requires per-folder listFolder calls and is left to the slow fallback only
+// when the user opts in.
+async function cleanupEmptyFoldersFast(rootCid /* , isMedia */) {
   const rootStr = String(rootCid);
   const info = await getFolderInfo(rootStr);
   const pickcode = info?.pick_code || info?.pickcode || info?.data?.pick_code;
@@ -1309,7 +1311,6 @@ async function cleanupEmptyFoldersFast(rootCid, isMedia) {
     const node = nodeById.get(pid);
     if (node) node.fileCount++;
   }
-  // Bottom-up roll-up
   function rollup(id) {
     const node = nodeById.get(id);
     if (!node) return 0;
@@ -1320,25 +1321,21 @@ async function cleanupEmptyFoldersFast(rootCid, isMedia) {
   }
   rollup(rootStr);
 
-  // Top-level empty branches (subtree has zero files AND parent has files or is root)
+  // Top-level empty branches only: avoid deleting nested empties separately
+  // since the parent delete cascades.
   const emptyBranches = [];
-  const folderJunkCheck = [];
   function visit(id, parentIsEmpty) {
     const node = nodeById.get(id);
     if (!node) return;
     const isEmpty = node.subtreeFiles === 0;
-    if (id !== rootStr) {
-      if (isEmpty && !parentIsEmpty) {
-        emptyBranches.push({ id, parentId: node.parentId, name: node.name });
-      } else if (!isEmpty && node.fileCount > 0) {
-        folderJunkCheck.push({ id, parentId: node.parentId, name: node.name, depth: 0 });
-      }
+    if (id !== rootStr && isEmpty && !parentIsEmpty) {
+      emptyBranches.push({ id, parentId: node.parentId, name: node.name });
     }
     for (const c of node.children) visit(c, isEmpty || parentIsEmpty);
   }
   visit(rootStr, false);
 
-  logger.info('Organizer', `[fast-cleanup] 树规模: ${nodeById.size - 1} 目录 / ${files.length} 文件; 待删空分支: ${emptyBranches.length}; 待核查含文件目录: ${folderJunkCheck.length}`);
+  logger.info('Organizer', `[fast-cleanup] 树规模: ${nodeById.size - 1} 目录 / ${files.length} 文件; 待删空分支: ${emptyBranches.length}`);
 
   for (const b of emptyBranches) {
     logger.info('Organizer', `删除空文件夹分支: ${b.name} cid=${b.id}`);
@@ -1346,32 +1343,6 @@ async function cleanupEmptyFoldersFast(rootCid, isMedia) {
       await deleteFolder(b.id, b.parentId);
     } catch (err) {
       logger.warn('Organizer', `删除失败: ${b.name} cid=${b.id} - ${err.message}`);
-    }
-  }
-
-  // depth bottom-up for junk check
-  function computeDepth(id) {
-    let d = 0, cur = id;
-    while (cur && cur !== rootStr) {
-      cur = nodeById.get(cur)?.parentId;
-      d++;
-      if (d > 64) break;
-    }
-    return d;
-  }
-  for (const j of folderJunkCheck) j.depth = computeDepth(j.id);
-  folderJunkCheck.sort((a, b) => b.depth - a.depth);
-  for (const j of folderJunkCheck) {
-    try {
-      const items = await listFolder(j.id);
-      const hasMedia = items.some(it => !it.isFolder && isMedia(it.name));
-      const hasFolder = items.some(it => it.isFolder);
-      if (!hasMedia && !hasFolder) {
-        logger.info('Organizer', `删除仅含非媒体文件的文件夹: ${j.name} cid=${j.id}`);
-        await deleteFolder(j.id, j.parentId);
-      }
-    } catch (err) {
-      logger.warn('Organizer', `核查/删除失败: ${j.name} cid=${j.id} - ${err.message}`);
     }
   }
 }
