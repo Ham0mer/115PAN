@@ -594,6 +594,13 @@ function classifyTargetPath(id, cfg) {
  * 6) 启用通知则发送成功通知。
  */
 async function processMovieGroup(group, id, cfg, taskId, stats) {
+  // 与剧集一致：无 tmdbId 不建目录，避免渲染出 "{tmdb-}" 这类墓碑名。
+  if (!id.tmdbId) {
+    await pushUnmatched(group, id, '缺少 tmdbId');
+    stats.skip++;
+    return;
+  }
+
   const cache = cfg._targetCache || null;
   const categoryPath = classifyTargetPath(id, cfg);
   const catCid = await ensureFolderPath(cfg.target_cid, categoryPath, cache);
@@ -695,6 +702,17 @@ async function processTVGroup(group, id, cfg, taskId, stats, cancel, episodeSumm
     });
   }
   if (!episodes.length) return;
+
+  // 无 tmdbId 不建剧目录：否则模板里的 {tmdb-} / {tmdbid=} 会渲染成"墓碑名"目录，
+  // 后续也无法用 findExistingShowCid 复用。统一进 unmatched 等用户手动处理。
+  if (!id.tmdbId) {
+    for (const ep of episodes) {
+      await pushUnmatched({ ...group, videos: [ep.video], metas: [] },
+        { ...id, season: ep.season, episode: ep.episode }, '缺少 tmdbId');
+      stats.skip++;
+    }
+    return;
+  }
 
   // 确保剧目录存在（优先复用已有 tmdbId 文件夹）
   const cache = cfg._targetCache || null;
@@ -1464,33 +1482,45 @@ async function processTVManual(group, id, cfg, taskId, stats, cancel, overrides,
 
 /**
  * 清理空目录的入口。优先快速路径，失败回退慢速路径。
- * 快速路径只能识别"子树内一个媒体文件都没有"的空分支；
- * 慢速路径还能识别"残留少量非媒体垃圾"的目录（用 isMedia 判别）。
+ *
+ * 判定一个文件是否"算数"（阻止目录被删）：
+ *   - 必须是媒体扩展名（视频或元数据），否则视为垃圾（如 .DS_Store/Thumbs.db）
+ *   - 若是视频，size 必须 ≥ min_video_size_mb（小于阈值的视频与 filterFiles 一致，视作可丢弃）
+ *
+ * 快/慢两条路径共用上述谓词，行为一致：
+ *   - 子树内没有任何"算数"的文件 → 整枝删除
  */
 async function cleanupEmptyFolders(rootCid) {
   const cfg = getConfig();
   const videoExts = new Set(parseExts(cfg?.video_extensions, VIDEO_EXTS_DEFAULT));
   const metaExts = new Set(parseExts(cfg?.meta_extensions, META_EXTS_DEFAULT));
-  const isMedia = name => { const e = extOf(name); return videoExts.has(e) || metaExts.has(e); };
+  const minSize = (Number(cfg?.min_video_size_mb) || 0) * 1024 * 1024;
+
+  /** @returns true 表示该文件应阻止其所在目录被清理 */
+  const keepsFolder = (name, size) => {
+    const e = extOf(name);
+    if (videoExts.has(e)) return !(minSize > 0 && Number(size || 0) < minSize);
+    return metaExts.has(e);
+  };
 
   try {
-    await cleanupEmptyFoldersFast(rootCid, isMedia);
+    await cleanupEmptyFoldersFast(rootCid, keepsFolder);
     return;
   } catch (err) {
     logger.warn('Organizer', `快速清理空目录失败，回退到逐目录递归: ${err.message}`);
   }
-  await cleanupEmptyFoldersSlow(rootCid, isMedia);
+  await cleanupEmptyFoldersSlow(rootCid, keepsFolder);
 }
 
 /**
  * 快速清理：通过 downfolders + downfiles 两次 API 拿到子树骨架与文件父目录映射，
- * 在内存里 rollup 每个目录的 subtreeFiles 数量，找出 subtreeFiles=0 的顶级空分支批量删除。
+ * 在内存里 rollup 每个目录的 keepCount，找出子树内无任何"算数文件"的顶层分支批量删除。
  *
  * 设计要点：
- * - 只删"顶级空分支"，不重复删除其嵌套子目录（115 删除会级联，ignore_warn=1）；
- * - 含非媒体垃圾（如 .DS_Store）的目录不在这里处理；要彻底清理需走慢速路径。
+ * - keepsFolder 谓词与慢速路径一致：非媒体垃圾、过小视频都不算数；
+ * - 只删"顶层空分支"，不重复删除其嵌套子目录（115 删除会级联，ignore_warn=1）。
  */
-async function cleanupEmptyFoldersFast(rootCid /* , isMedia */) {
+async function cleanupEmptyFoldersFast(rootCid, keepsFolder) {
   const rootStr = String(rootCid);
   const info = await getFolderInfo(rootStr);
   const pickcode = info?.pick_code || info?.pickcode || info?.data?.pick_code;
@@ -1503,13 +1533,13 @@ async function cleanupEmptyFoldersFast(rootCid /* , isMedia */) {
 
   // 构建 cid → 节点
   const nodeById = new Map();
-  nodeById.set(rootStr, { name: `根目录#${rootStr}`, parentId: null, children: [], fileCount: 0, subtreeFiles: 0 });
+  nodeById.set(rootStr, { name: `根目录#${rootStr}`, parentId: null, children: [], keepCount: 0, subtreeKeep: 0 });
   for (const f of folders) {
     const id = String(f.fid || f.cid || f.id || '');
     if (!id) continue;
     const name = String(f.fn || f.n || f.name || '');
     const pid = String(f.pid || f.parent_id || rootStr);
-    nodeById.set(id, { name, parentId: pid, children: [], fileCount: 0, subtreeFiles: 0 });
+    nodeById.set(id, { name, parentId: pid, children: [], keepCount: 0, subtreeKeep: 0 });
   }
   // 反向把每个节点登记到父节点的 children 数组
   for (const [id, node] of nodeById) {
@@ -1517,19 +1547,24 @@ async function cleanupEmptyFoldersFast(rootCid /* , isMedia */) {
     const parent = nodeById.get(node.parentId);
     if (parent) parent.children.push(id);
   }
-  // 累计每个目录的直接文件数
+  // 仅累计"算数"的文件：媒体扩展名 + 视频需达到 min_video_size_mb
+  let droppedJunk = 0;
   for (const f of files) {
     const pid = String(f.pid || f.parent_id || '');
     const node = nodeById.get(pid);
-    if (node) node.fileCount++;
+    if (!node) continue;
+    const fname = String(f.fn || f.n || f.name || f.file_name || '');
+    const fsize = Number(f.fs || f.s || f.size || f.file_size || 0);
+    if (keepsFolder(fname, fsize)) node.keepCount++;
+    else droppedJunk++;
   }
-  /** 递归汇总子树文件总数到 subtreeFiles。 */
+  /** 递归汇总子树"算数文件"总数到 subtreeKeep。 */
   function rollup(id) {
     const node = nodeById.get(id);
     if (!node) return 0;
-    let n = node.fileCount;
+    let n = node.keepCount;
     for (const c of node.children) n += rollup(c);
-    node.subtreeFiles = n;
+    node.subtreeKeep = n;
     return n;
   }
   rollup(rootStr);
@@ -1539,7 +1574,7 @@ async function cleanupEmptyFoldersFast(rootCid /* , isMedia */) {
   function visit(id, parentIsEmpty) {
     const node = nodeById.get(id);
     if (!node) return;
-    const isEmpty = node.subtreeFiles === 0;
+    const isEmpty = node.subtreeKeep === 0;
     if (id !== rootStr && isEmpty && !parentIsEmpty) {
       emptyBranches.push({ id, parentId: node.parentId, name: node.name });
     }
@@ -1547,7 +1582,7 @@ async function cleanupEmptyFoldersFast(rootCid /* , isMedia */) {
   }
   visit(rootStr, false);
 
-  logger.info('Organizer', `[fast-cleanup] 树规模: ${nodeById.size - 1} 目录 / ${files.length} 文件; 待删空分支: ${emptyBranches.length}`);
+  logger.info('Organizer', `[fast-cleanup] 树规模: ${nodeById.size - 1} 目录 / ${files.length} 文件 (忽略垃圾/过小视频 ${droppedJunk}); 待删空分支: ${emptyBranches.length}`);
 
   for (const b of emptyBranches) {
     logger.info('Organizer', `删除空文件夹分支: ${b.name} cid=${b.id}`);
@@ -1560,10 +1595,11 @@ async function cleanupEmptyFoldersFast(rootCid /* , isMedia */) {
 }
 
 /**
- * 慢速清理：递归遍历，叶子目录里若没有任何"媒体文件"（包括非媒体垃圾如 .DS_Store 也视为可清理）
- * 就把整个目录回收。返回值 hasMedia 用于回溯告诉父节点"我这枝还有媒体文件"。
+ * 慢速清理：递归遍历，子树内没有任何"算数文件"就把整个目录回收。
+ * "算数文件"由 keepsFolder 判定：必须是媒体扩展名；视频还要 ≥ min_video_size_mb。
+ * 返回值 hasKeep 用于回溯告诉父节点"我这枝有不可丢弃的文件"。
  */
-async function cleanupEmptyFoldersSlow(rootCid, isMedia) {
+async function cleanupEmptyFoldersSlow(rootCid, keepsFolder) {
   async function walk(cid, parentCid, name) {
     let items;
     try {
@@ -1572,24 +1608,24 @@ async function cleanupEmptyFoldersSlow(rootCid, isMedia) {
       logger.warn('Organizer', `空文件夹清理：列目录失败 ${name || ''} cid=${cid}`, err.message);
       return true;
     }
-    let hasMedia = false;
+    let hasKeep = false;
     for (const it of items) {
       if (it.isFolder) {
-        const subHasMedia = await walk(it.id, cid, it.name);
-        if (subHasMedia) hasMedia = true;
-      } else if (isMedia(it.name)) {
-        hasMedia = true;
+        const subHasKeep = await walk(it.id, cid, it.name);
+        if (subHasKeep) hasKeep = true;
+      } else if (keepsFolder(it.name, it.size)) {
+        hasKeep = true;
       }
     }
-    if (parentCid != null && !hasMedia) {
-      logger.info('Organizer', `删除无媒体子文件夹: ${name} cid=${cid}`);
+    if (parentCid != null && !hasKeep) {
+      logger.info('Organizer', `删除无有效媒体的子文件夹: ${name} cid=${cid}`);
       try {
         await deleteFolder(cid, parentCid);
       } catch (err) {
         logger.warn('Organizer', `删除空文件夹失败: ${name} cid=${cid}`, err.message);
       }
     }
-    return hasMedia;
+    return hasKeep;
   }
   await walk(String(rootCid), null, `根目录#${rootCid}`);
 }

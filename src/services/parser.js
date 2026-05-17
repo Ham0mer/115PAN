@@ -140,6 +140,14 @@ export function parseFilename(filename) {
   // 去帧率（60fps / 24fps）与质量标签（HQ/LQ）
   remaining = remaining.replace(/\b\d{2,3}\s*fps\b/gi, ' ').replace(/\b(?:HQ|LQ|HighQuality|LowQuality)\b/g, ' ').replace(/\s+/g, ' ');
 
+  // 流媒体平台标签（Disney+/Netflix/AMZN/...）——这些是发行渠道，不属于片名也不属于音视频规格。
+  // 不剥掉的话会污染 title（典型："Disney+" 因含 "+" 不被尾部 ASCII 剥离规则识别）。
+  // 注意：Disney+ / Paramount+ 末尾的 "+" 是非词字符，不能再写 \b，否则正则只会匹配到 "Disney" 把 "+" 留下来。
+  remaining = remaining.replace(
+    /\b(Disney\+|Paramount\+|DSNP|Netflix|NF|AMZN|Amazon|ATVP|iTunes|HMAX|HBOMax|HBO|Hulu|Peacock|PCOK|PMTP|iQIYI|iQiyi|YOUKU|Youku|MGTV|MangoTV|Bilibili|Tencent|WeTV|Viki|Crunchyroll|Funimation|FUNI)(?![A-Za-z0-9])/gi,
+    ' '
+  ).replace(/\s+/g, ' ');
+
   // HDR 探测：HDR / HDR10 / HDR10+ / HLG / Dolby Vision / DoVi
   if (/\b(HDR|HDR10|HDR10\+|HLG|Dolby\s*Vision|DoVi)\b/i.test(remaining)) {
     result.hdr = remaining.match(/\b(HDR|HDR10|HDR10\+|HLG|Dolby\s*Vision|DoVi)\b/i)[0];
@@ -184,8 +192,15 @@ export function parseFilename(filename) {
   }
 
   // 先尝试在末尾抓发布组（"-FRDS" 之类），放在音频前面做，否则音频规则可能贪婪吃进去。
+  // 排除掉看起来像季/集标记的形态（S04E10 / 1x02 / E10），否则它们会被误当成发布组，
+  // 等季集规则跑到时已经没机会识别了。
   const rgEarly = remaining.match(/[-]\s*([A-Za-z][A-Za-z0-9]{1,9})\s*$/);
-  if (rgEarly && !RESOLUTIONS.includes(rgEarly[1]) && !SOURCES.includes(rgEarly[1])) {
+  if (rgEarly
+      && !RESOLUTIONS.includes(rgEarly[1])
+      && !SOURCES.includes(rgEarly[1])
+      && !/^[Ss]\d{1,3}([Ee]\d{1,3})?$/.test(rgEarly[1])
+      && !/^[Ee][Pp]?\d{1,3}$/.test(rgEarly[1])
+      && !/^\d{1,2}[xX]\d{1,3}$/.test(rgEarly[1])) {
     result.releaseGroup = rgEarly[1];
     remaining = remaining.slice(0, -rgEarly[0].length);
   }
@@ -198,8 +213,8 @@ export function parseFilename(filename) {
     result.audioCodec = audMatch[2].trim();
     remaining = remaining.replace(/\d+\s*Audios?\s*[A-Za-z][A-Za-z0-9.+:]*/i, ' ');
   } else {
-    // 再识别带声道数的形式（如 DDP2.0 / TrueHD7.1 / AAC2.0）
-    const audChMatch = remaining.match(/\b(DDP|TrueHD|Atmos|DTS-HD\s*MA|DTS-HD|DTS(?::?X)?|AAC|AC3|EAC3|FLAC|PCM|MP3|WMA|OPUS)(\d+\.\d+|\d+)\b/i);
+    // 再识别带声道数的形式（如 DDP2.0 / TrueHD7.1 / AAC2.0；也兼容中间有空格的 "DDP 5.1"）
+    const audChMatch = remaining.match(/\b(DDP|TrueHD|Atmos|DTS-HD\s*MA|DTS-HD|DTS(?::?X)?|AAC|AC3|EAC3|FLAC|PCM|MP3|WMA|OPUS)\s*(\d+\.\d+|\d+)\b/i);
     if (audChMatch) {
       result.audioCodec = audChMatch[1].toUpperCase();
       remaining = remaining.replace(audChMatch[0], ' ');
@@ -271,6 +286,11 @@ export function parseFilename(filename) {
       }
     }
   }
+  // 即使上面用 S/E 已经抓到，也把残留的中文季/集标记从 title 里清掉，
+  // 避免出现 "天堂镇警局 第10集" 这种重复信息。
+  remaining = remaining
+    .replace(/第\s*[零一二三四五六七八九十\d]{1,4}\s*[季集話话回]/g, ' ')
+    .replace(/\s+/g, ' ');
 
   // 出现季或集号即判定为剧集
   if (result.season !== null || result.episode !== null) {
@@ -287,7 +307,12 @@ export function parseFilename(filename) {
   // releaseGroup 二次兜底：前面没抓到，从最终残余末尾再试一次
   if (!result.releaseGroup) {
     const rgMatch = remaining.match(/[-.]\s*([A-Za-z][A-Za-z0-9]{1,9})\s*$/);
-    if (rgMatch && !RESOLUTIONS.includes(rgMatch[1]) && !SOURCES.includes(rgMatch[1])) {
+    if (rgMatch
+        && !RESOLUTIONS.includes(rgMatch[1])
+        && !SOURCES.includes(rgMatch[1])
+        && !/^[Ss]\d{1,3}([Ee]\d{1,3})?$/.test(rgMatch[1])
+        && !/^[Ee][Pp]?\d{1,3}$/.test(rgMatch[1])
+        && !/^\d{1,2}[xX]\d{1,3}$/.test(rgMatch[1])) {
       result.releaseGroup = rgMatch[1];
       remaining = remaining.slice(0, -rgMatch[0].length);
     }
@@ -301,7 +326,7 @@ export function parseFilename(filename) {
     .replace(/\b(19|20)\d{2}\b/g, ' ')
     .replace(/[._]+/g, ' ')
     .replace(/\s+/g, ' ')
-    .trim();
+    .replace(/^[\s\-]+|[\s\-]+$/g, '');
 
   result.title = remaining;
 
