@@ -1189,37 +1189,42 @@ async function processTVManual(group, id, cfg, taskId, stats, cancel, overrides,
 
 // ----- Clean up empty folders -----
 
-async function cleanupEmptyFolders(cid) {
+async function cleanupEmptyFolders(rootCid) {
   const cfg = getConfig();
   const videoExts = new Set(parseExts(cfg?.video_extensions, VIDEO_EXTS_DEFAULT));
   const metaExts = new Set(parseExts(cfg?.meta_extensions, META_EXTS_DEFAULT));
   const isMedia = name => { const e = extOf(name); return videoExts.has(e) || metaExts.has(e); };
 
-  let items;
-  try {
-    items = await listFolder(cid);
-  } catch (err) {
-    logger.warn('Organizer', `空文件夹清理：列目录失败 cid=${cid}`, err.message);
-    return;
+  // 单次自下而上递归：每个目录只 listFolder 一次。返回该子树是否包含媒体文件。
+  async function walk(cid, parentCid, name) {
+    let items;
+    try {
+      items = await listFolder(cid);
+    } catch (err) {
+      logger.warn('Organizer', `空文件夹清理：列目录失败 ${name || ''} cid=${cid}`, err.message);
+      return true; // 列举失败时保守认为非空，不删
+    }
+
+    let hasMedia = false;
+    for (const it of items) {
+      if (it.isFolder) {
+        const subHasMedia = await walk(it.id, cid, it.name);
+        if (subHasMedia) hasMedia = true;
+      } else if (isMedia(it.name)) {
+        hasMedia = true;
+      }
+    }
+
+    if (parentCid != null && !hasMedia) {
+      logger.info('Organizer', `删除无媒体子文件夹: ${name} cid=${cid}`);
+      try {
+        await deleteFolder(cid, parentCid);
+      } catch (err) {
+        logger.warn('Organizer', `删除空文件夹失败: ${name} cid=${cid}`, err.message);
+      }
+    }
+    return hasMedia;
   }
 
-  for (const item of items) {
-    if (!item.isFolder) continue;
-    let children;
-    try {
-      children = await listFilesRecursive(item.id, { maxDepth: 8 });
-    } catch (err) {
-      logger.warn('Organizer', `空文件夹清理：递归列举失败 ${item.name} cid=${item.id}`, err.message);
-      continue;
-    }
-    const mediaCount = children.filter(f => isMedia(f.name)).length;
-    if (mediaCount > 0) continue;
-
-    logger.info('Organizer', `删除无媒体子文件夹: ${item.name} cid=${item.id} (共${children.length}个文件)`);
-    try {
-      await deleteFolder(item.id, cid);
-    } catch (err) {
-      logger.warn('Organizer', `删除空文件夹失败: ${item.name} cid=${item.id}`, err.message);
-    }
-  }
+  await walk(String(rootCid), null, `根目录#${rootCid}`);
 }

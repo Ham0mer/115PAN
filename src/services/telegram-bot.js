@@ -331,11 +331,17 @@ async function pollLoop(rec) {
       }
     } catch (err) {
       if (rec.stopped) break;
-      if (!/abort|timeout/i.test(err?.message || '')) {
-        logger.warn('TelegramBot', `轮询异常: ${err.message}`);
+      rec.errCount = (rec.errCount || 0) + 1;
+      const isTimeout = /abort|timeout/i.test(err?.message || '');
+      if (!isTimeout && (rec.errCount === 1 || rec.errCount % 20 === 0)) {
+        logger.warn('TelegramBot', `轮询异常 (累计${rec.errCount}次): ${err.message}`);
       }
-      await sleep(3000);
+      // 指数退避：3s → 6s → 12s → 24s → 48s → 60s 封顶
+      const backoff = Math.min(3000 * Math.pow(2, Math.min(rec.errCount - 1, 5)), 60000);
+      await sleep(backoff);
+      continue;
     }
+    rec.errCount = 0;
   }
   logger.info('TelegramBot', `Bot ${rec.cfg.name || rec.cfg.id} 轮询已停止`);
 }

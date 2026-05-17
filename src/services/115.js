@@ -10,6 +10,11 @@ function getOpDelayMs() {
   }
 }
 
+// 每次写操作（move/rename/delete/create）后的小延时，避免风控
+const WRITE_OP_DELAY_MS = 1200;
+const DELETE_OP_DELAY_MS = 1500;
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
 const UA_APPLE_TV = 'Mozilla/5.0 (Apple TV; CPU tvOS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko)';
 const UA_CHROME = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.93 Safari/537.36';
 
@@ -251,11 +256,13 @@ export async function renameFile(fileId, newName) {
   // 115 batch_rename takes files_new_name[FID]=NEWNAME
   const body = new URLSearchParams();
   body.append(`files_new_name[${fileId}]`, newName);
-  return fetch115Api(url, {
+  const res = await fetch115Api(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: body.toString(),
   });
+  await sleep(WRITE_OP_DELAY_MS);
+  return res;
 }
 
 export async function moveFile(fileId, targetCid) {
@@ -263,11 +270,13 @@ export async function moveFile(fileId, targetCid) {
   const body = new URLSearchParams();
   body.append('fid[0]', String(fileId));
   body.append('pid', String(targetCid));
-  return fetch115Api(url, {
+  const res = await fetch115Api(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: body.toString(),
   });
+  await sleep(WRITE_OP_DELAY_MS);
+  return res;
 }
 
 export async function createFolder(parentCid, folderName) {
@@ -278,6 +287,7 @@ export async function createFolder(parentCid, folderName) {
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body,
   });
+  await sleep(WRITE_OP_DELAY_MS);
   // Response may be { state, cid, cname } or { state, data: { ... } }
   const cid = data.cid || data.data?.cid || data.data?.file_id || data.data?.fid;
   if (!cid) throw new Error('创建目录失败：响应缺少 cid');
@@ -288,11 +298,13 @@ export async function moveToRecycle(fileId) {
   const url = 'https://webapi.115.com/rb/delete';
   const body = new URLSearchParams();
   body.append('fid[0]', String(fileId));
-  return fetch115Api(url, {
+  const res = await fetch115Api(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: body.toString(),
   });
+  await sleep(WRITE_OP_DELAY_MS);
+  return res;
 }
 
 export async function deleteFile(fileId) {
@@ -307,11 +319,13 @@ export async function deleteFolder(cid, parentCid) {
   // 115 的 rb/delete 接口：文件夹下若残留子目录（即使没有文件），
   // ignore_warn=0 会被服务端的二次确认提示挡住而无法删除。
   body.append('ignore_warn', '1');
-  return fetch115Api(url, {
+  const res = await fetch115Api(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: body.toString(),
   });
+  await sleep(DELETE_OP_DELAY_MS);
+  return res;
 }
 
 export async function getDownloadUrl(fileId) {
