@@ -236,7 +236,7 @@ export async function listFolder(cid, { onlyFolders = false } = {}) {
     if (items.length < limit) break;
     const total = Number(data?.count || data?.total || 0);
     if (total && offset >= total) break;
-    await new Promise(r => setTimeout(r, getOpDelayMs()));
+    await new Promise(r => setTimeout(r, Math.min(getOpDelayMs(), 1500)));
   }
   return all;
 }
@@ -555,12 +555,113 @@ export async function transferShareLink(link, targetCid = '0') {
 }
 
 // List videos / metas recursively. maxDepth guards against pathological structures.
-// NOTE: downfiles doesn't return file names, so the bulk fast path is unusable for
-// source scanning. We keep the per-folder slow walker as the only implementation here.
-// listFilesRecursiveFast/listAllSubFiles remain exported for other callers but MUST NOT
-// be used when filenames are required.
+// Strategy:
+//   1. Fast: one downfolders + one downfiles call expose the full tree. distinct(downfiles.pid)
+//      gives every folder that actually contains files (downfiles.pid == downfolders.fid).
+//      We then listFolder ONLY those folders to obtain real filenames. Intermediate folders
+//      with no direct files are visited entirely in-memory (no API call).
+//   2. Slow fallback: original per-folder DFS, in case the bulk endpoints reject or root has
+//      no pickcode (cid=0).
 export async function listFilesRecursive(rootCid, { maxDepth = 8, onItem } = {}) {
-  return listFilesRecursiveSlow(String(rootCid), { maxDepth, onItem });
+  const cidStr = String(rootCid);
+  if (cidStr !== '0') {
+    try {
+      return await listFilesRecursiveHybrid(cidStr, { maxDepth, onItem });
+    } catch (err) {
+      logger.warn('115', `快速源扫描失败，回退到逐目录递归: ${err.message}`);
+    }
+  }
+  return listFilesRecursiveSlow(cidStr, { maxDepth, onItem });
+}
+
+// Hybrid scanner: bulk tree + targeted listFolder on leaf folders that hold files.
+async function listFilesRecursiveHybrid(rootCid, { maxDepth = 8, onItem } = {}) {
+  const rootStr = String(rootCid);
+  const info = await getFolderInfo(rootStr);
+  const pickcode = String(
+    pickField(info, 'pick_code', 'pickcode', 'pc') ||
+    pickField(info?.data || {}, 'pick_code', 'pickcode', 'pc') || ''
+  );
+  if (!pickcode) throw new Error('未取得根 pickcode');
+
+  const [folders, files] = await Promise.all([
+    listAllSubFolders(pickcode),
+    listAllSubFiles(pickcode),
+  ]);
+
+  const dirById = new Map();
+  dirById.set(rootStr, { name: '', parentId: null });
+  for (const f of folders) {
+    const id = String(pickField(f, 'fid', 'cid', 'id') || '');
+    if (!id) continue;
+    const name = String(pickField(f, 'fn', 'n', 'name') || '');
+    const pid = String(pickField(f, 'pid', 'parent_id', 'cpid') || rootStr);
+    dirById.set(id, { name, parentId: pid });
+  }
+
+  const segsCache = new Map();
+  function segsFor(cid) {
+    if (cid === rootStr) return [];
+    const cached = segsCache.get(cid);
+    if (cached) return cached;
+    const segs = [];
+    let cur = cid, safety = 64;
+    while (cur && cur !== rootStr && safety-- > 0) {
+      const node = dirById.get(cur);
+      if (!node) break;
+      segs.unshift(node.name);
+      cur = node.parentId;
+    }
+    segsCache.set(cid, segs);
+    return segs;
+  }
+
+  // Distinct parent folders that hold direct files
+  const targets = new Set();
+  for (const f of files) {
+    const pid = String(pickField(f, 'pid', 'parent_id') || '');
+    if (!pid) continue;
+    if (pid !== rootStr && !dirById.has(pid)) continue;
+    targets.add(pid);
+  }
+
+  const targetsArr = [...targets];
+  logger.info('115', `[fast-scan] 总目录=${dirById.size - 1} downfiles=${files.length} 待扫含文件目录=${targets.size}`);
+
+  const result = [];
+  const t0 = Date.now();
+  let done = 0;
+  for (const pid of targetsArr) {
+    const segs = pid === rootStr ? [] : segsFor(pid);
+    const depth = segs.length;
+    if (depth > maxDepth) { done++; continue; }
+    const callStart = Date.now();
+    const label = segs.length ? segs[segs.length - 1] : `cid=${pid}`;
+    logger.info('115', `[fast-scan] (${done + 1}/${targetsArr.length}) → ${label}`);
+    let items;
+    try {
+      items = await listFolder(pid, { onlyFolders: false });
+    } catch (err) {
+      logger.warn('115', `[fast-scan] listFolder(${pid}) 失败 用时${Date.now() - callStart}ms: ${err.message}`);
+      done++;
+      continue;
+    }
+    const fileCount = items.filter(it => !it.isFolder).length;
+    for (const it of items) {
+      if (it.isFolder) continue;
+      const entry = { ...it, depth, pathSegs: [...segs] };
+      result.push(entry);
+      if (onItem) onItem(entry);
+    }
+    done++;
+    logger.info('115', `[fast-scan]   ← ${fileCount} 文件 用时${Date.now() - callStart}ms`);
+    // Reads need only mild pacing; the user's operation_delay_sec is tuned for writes
+    // and would otherwise blow up scan time on flat libraries.
+    const delay = Math.min(getOpDelayMs(), 1500);
+    if (delay > 0) await sleep(delay);
+  }
+  logger.info('115', `[fast-scan] 完成 ${done}/${targetsArr.length} 用时 ${Date.now() - t0}ms，文件 ${result.length}`);
+  return result;
 }
 
 async function listFilesRecursiveSlow(rootCid, { maxDepth = 8, onItem } = {}) {
@@ -573,7 +674,7 @@ async function listFilesRecursiveSlow(rootCid, { maxDepth = 8, onItem } = {}) {
     logger.debug('115', `listFolder(${cid}) depth=${depth} → ${folders.length} 文件夹, ${files.length} 文件`);
     for (const it of items) {
       if (it.isFolder) {
-        await new Promise(r => setTimeout(r, getOpDelayMs()));
+        await new Promise(r => setTimeout(r, Math.min(getOpDelayMs(), 1500)));
         await walk(it.id, depth + 1, [...pathSegs, it.name]);
       } else {
         const entry = { ...it, depth, pathSegs: [...pathSegs] };
