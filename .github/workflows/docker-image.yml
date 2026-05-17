@@ -14,18 +14,18 @@ jobs:
 
     steps:
       - name: Check out the repo
-        uses: actions/checkout@v4
-      
+        uses: actions/checkout@v5
+
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@v3.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      
+
       - name: Extract metadata (tags, labels) for Docker
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v5.9.0
         with:
           images: ghcr.io/${{ github.repository }}
           # 标签自动对应 Release Tag，并始终更新 latest
@@ -33,9 +33,9 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest
-      
+
       - name: Build and push Docker image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           context: .
           push: true
