@@ -12,7 +12,7 @@ function getOpDelayMs() {
 
 // 每次写操作（move/rename/delete/create）后的小延时，避免风控
 const WRITE_OP_DELAY_MS = 1200;
-const DELETE_OP_DELAY_MS = 1500;
+const DELETE_OP_DELAY_MS = 10000;
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 const UA_APPLE_TV = 'Mozilla/5.0 (Apple TV; CPU tvOS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko)';
@@ -236,7 +236,7 @@ export async function listFolder(cid, { onlyFolders = false } = {}) {
     if (items.length < limit) break;
     const total = Number(data?.count || data?.total || 0);
     if (total && offset >= total) break;
-    await new Promise(r => setTimeout(r, Math.min(getOpDelayMs(), 1500)));
+    await new Promise(r => setTimeout(r, Math.min(getOpDelayMs(), 10000)));
   }
   return all;
 }
@@ -657,7 +657,7 @@ async function listFilesRecursiveHybrid(rootCid, { maxDepth = 8, onItem } = {}) 
     logger.info('115', `[fast-scan]   ← ${fileCount} 文件 用时${Date.now() - callStart}ms`);
     // Reads need only mild pacing; the user's operation_delay_sec is tuned for writes
     // and would otherwise blow up scan time on flat libraries.
-    const delay = Math.min(getOpDelayMs(), 1500);
+    const delay = Math.min(getOpDelayMs(), 10000);
     if (delay > 0) await sleep(delay);
   }
   logger.info('115', `[fast-scan] 完成 ${done}/${targetsArr.length} 用时 ${Date.now() - t0}ms，文件 ${result.length}`);
@@ -674,7 +674,7 @@ async function listFilesRecursiveSlow(rootCid, { maxDepth = 8, onItem } = {}) {
     logger.debug('115', `listFolder(${cid}) depth=${depth} → ${folders.length} 文件夹, ${files.length} 文件`);
     for (const it of items) {
       if (it.isFolder) {
-        await new Promise(r => setTimeout(r, Math.min(getOpDelayMs(), 1500)));
+        await new Promise(r => setTimeout(r, Math.min(getOpDelayMs(), 10000)));
         await walk(it.id, depth + 1, [...pathSegs, it.name]);
       } else {
         const entry = { ...it, depth, pathSegs: [...pathSegs] };
