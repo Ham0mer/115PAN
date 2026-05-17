@@ -21,17 +21,26 @@ import {
 } from './template.js';
 import { notifySuccess, notifyFailure, notifyEpisodes } from './telegram.js';
 
+// 默认视频/元数据扩展名（用户未配置时使用）
 const VIDEO_EXTS_DEFAULT = 'mp4,mkv,avi,mov,rmvb,wmv,ts,iso,m2ts';
 const META_EXTS_DEFAULT = 'ass,srt,ssa,sub,vtt,nfo,xml';
 
+/**
+ * 读取整理配置（单行）。
+ */
 function getConfig() {
   return getDb().prepare('SELECT * FROM config_organize WHERE id=1').get();
 }
 
-// Best-effort: build an in-memory mirror of cfg.target_cid's folder subtree so
-// ensureFolderPath / getOrCreateChildFolder / findExistingShowCid can resolve
-// known paths without API calls. Stored on cfg so it's threaded implicitly
-// through every helper that already receives cfg. Failures degrade silently.
+/**
+ * 在 cfg 上挂载目标目录的内存子树缓存，供 ensureFolderPath / getOrCreateChildFolder /
+ * findExistingShowCid 直接命中已知路径而无需调 API。
+ *
+ * - 失败一律降级（_targetCache=null），后续函数会自动回退到逐次 API 查询；
+ * - 用 cfg._targetCache 透传，避免在所有 helper 之间显式传 cache。
+ *
+ * @returns {Promise<FolderTreeCache|null>}
+ */
 async function attachTargetCache(cfg) {
   if (!cfg || cfg._targetCache !== undefined) return cfg?._targetCache;
   if (!cfg.target_cid || String(cfg.target_cid) === '0') {
@@ -51,28 +60,39 @@ async function attachTargetCache(cfg) {
   }
 }
 
+/**
+ * 把逗号分隔的扩展名 CSV 解析为小写、trim 后的数组；空时回退到默认值。
+ */
 function parseExts(csv, fallback) {
   return (csv || fallback).split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
 }
 
+/** 取文件名扩展名（小写，不含点）。 */
 function extOf(name) {
   const m = String(name || '').match(/\.([^.]+)$/);
   return m ? m[1].toLowerCase() : '';
 }
 
+/** 取文件名主干（去掉扩展名）。 */
 function stemOf(name) {
   return String(name || '').replace(/\.[^.]+$/, '');
 }
 
+/** Promise 化的 sleep。 */
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// ----- Cancellation -----
+// ===== 取消令牌 =====
+// 通过 taskId → 一个 { cancelled } 对象的弱协议实现协作式取消。
+// 整理流程中各处会读取 cancel.cancelled 主动退出，避免硬中断。
 
 const cancelTokens = new Map();
 function getCancelToken(taskId) {
   if (!cancelTokens.has(taskId)) cancelTokens.set(taskId, { cancelled: false });
   return cancelTokens.get(taskId);
 }
+/**
+ * 请求取消指定任务。下次循环边界时该任务会自然退出，并把 tasks.status 改为 'cancelled'。
+ */
 export function requestCancel(taskId) {
   const t = cancelTokens.get(taskId);
   if (t) t.cancelled = true;
@@ -81,14 +101,32 @@ function cleanupCancelToken(taskId) {
   cancelTokens.delete(taskId);
 }
 
-// ----- Entry point -----
+// ===== 入口 =====
 
+/**
+ * 整理任务主入口。可在调度器或人工触发时调用。
+ *
+ * 流程：
+ * 1) 读取配置，校验源/目标目录 → 创建或复用 tasks 记录；
+ * 2) 加载目标目录子树缓存；
+ * 3) listFilesRecursive 扫描源目录；空则仅清理空目录后退出；
+ * 4) filterFiles + groupFiles 形成"媒体单元"列表；
+ * 5) 逐组调用 processGroup，期间频繁检查取消令牌；
+ * 6) 任务完成后再清一次源目录残留空目录；
+ * 7) 若启用了聚合通知，按 tmdbId 一次性发送剧集合并通知；
+ * 8) 更新 tasks 状态并返回 { taskId, stats }。
+ *
+ * @param {number} [taskId] 可选：在已有任务行上继续运行（用于"重新运行"等场景）
+ * @param {Object} [options] 预留参数
+ * @returns {Promise<{taskId,stats,cancelled?}>} 统计信息含 scan/success/fail/skip
+ */
 export async function runOrganize(taskId, options = {}) {
   const db = getDb();
   const cfg = getConfig();
   if (!cfg) throw new Error('整理配置未设置');
   if (!cfg.source_cid || !cfg.target_cid) throw new Error('未配置源/目标目录');
 
+  // 新建任务行或复用已有
   if (!taskId) {
     const r = db.prepare("INSERT INTO tasks (status, started_at) VALUES ('running', datetime('now','localtime'))").run();
     taskId = r.lastInsertRowid;
@@ -97,7 +135,8 @@ export async function runOrganize(taskId, options = {}) {
   }
   const cancel = getCancelToken(taskId);
   const stats = { scan: 0, success: 0, fail: 0, skip: 0 };
-  const episodeSummary = new Map(); // tmdbId -> { title, items: [{season, episode, target}] }
+  // 用于聚合剧集通知：tmdbId → { title, items: [{season,episode}] }
+  const episodeSummary = new Map();
 
   try {
     logger.info('Organizer', `开始扫描 cid=${cfg.source_cid}`);
@@ -107,6 +146,7 @@ export async function runOrganize(taskId, options = {}) {
     logger.info('Organizer', `扫描完成: ${files.length} 个文件`);
 
     if (!files.length) {
+      // 源目录为空：仅清理残留空目录后结束。任务行也清理掉以免污染历史。
       logger.info('Organizer', `源目录无文件，仅清理残留空目录 cid=${cfg.source_cid}`);
       await cleanupEmptyFolders(cfg.source_cid);
       db.prepare('DELETE FROM task_items WHERE task_id=?').run(taskId);
@@ -128,6 +168,7 @@ export async function runOrganize(taskId, options = {}) {
       return { taskId, stats };
     }
 
+    // 逐组处理。组之间用 operation_delay_sec 节流。
     for (const group of groups) {
       if (cancel.cancelled) {
         logger.warn('Organizer', '任务被取消');
@@ -140,13 +181,14 @@ export async function runOrganize(taskId, options = {}) {
         logger.error('Organizer', `组处理失败: ${groupLabel(group)}`, err.message);
         stats.fail++;
         recordTaskItem(taskId, { error: err.message, source_path: group.parentCid, original_name: groupLabel(group) });
+        // 失败通知错误本身不应阻塞后续组，吞掉
         await notifyFailure(`处理失败: ${groupLabel(group)}`, err.message).catch(() => {});
       }
       const delaySec = Number(cfg.operation_delay_sec) || 1.5;
       await sleep(delaySec * 1000);
     }
 
-    // Clean up empty subfolders after processing
+    // 全部组结束后再清理一次（处理过程中可能产生新空目录）
     await cleanupEmptyFolders(cfg.source_cid);
   } catch (err) {
     logger.error('Organizer', '整理任务异常', err.message);
@@ -160,7 +202,7 @@ export async function runOrganize(taskId, options = {}) {
     scan_count=?, success_count=?, fail_count=?, skip_count=? WHERE id=?`)
     .run(stats.scan, stats.success, stats.fail, stats.skip, taskId);
 
-  // Aggregated TV episode notifications (one per show per task).
+  // 聚合剧集通知：每个剧只发一次合并消息。仅在该剧有 >1 集入库时发送。
   if (cfg.notify_enabled && !cfg.episode_per_notify) {
     for (const [, info] of episodeSummary) {
       if (info.items.length > 1) {
@@ -174,8 +216,12 @@ export async function runOrganize(taskId, options = {}) {
   return { taskId, stats };
 }
 
-// ----- Filtering & grouping -----
+// ===== 过滤 & 分组 =====
 
+/**
+ * 过滤文件：仅保留视频或元数据扩展名；视频还需达到 min_video_size_mb。
+ * 副作用：在文件对象上标注 _ext/_isVideo/_isMeta 以便后续分组无需重复判断。
+ */
 function filterFiles(files, cfg) {
   const videoExts = parseExts(cfg.video_extensions, VIDEO_EXTS_DEFAULT);
   const metaExts = parseExts(cfg.meta_extensions, META_EXTS_DEFAULT);
@@ -193,11 +239,14 @@ function filterFiles(files, cfg) {
   });
 }
 
-// Group filtered files into media units.
-// - Files inside a subfolder share that folder's group (forms A / C).
-// - Files directly in the root are sub-grouped by parsed (title, year) (forms B / D).
-// - Nested directories (form E): items inherit their direct-parent CID as the group, but identification
-//   later pulls metadata from the file itself, so nesting depth is irrelevant.
+/**
+ * 把过滤后的文件聚合为"媒体单元"组：
+ * - 处于子目录中的文件按 parentCid 聚合（A/C 形态）；
+ * - 直接位于源根目录的文件按 (title, year) 子分组（B/D 形态）；
+ * - 嵌套目录（E 形态）：仍按直接父目录归组，后续识别从文件本身拉取元数据，嵌套深度无关紧要。
+ *
+ * 过滤掉无视频的"孤儿元数据组"。
+ */
 function groupFiles(files, cfg) {
   const rootFiles = [];
   const byParent = new Map();
@@ -217,6 +266,7 @@ function groupFiles(files, cfg) {
     const videos = parentFiles.filter(f => f._isVideo);
     const metas = parentFiles.filter(f => f._isMeta);
     if (!videos.length) {
+      // 没有视频的目录视为孤儿，跳过（避免空跑下游识别）
       logger.debug('Organizer', `跳过孤立元数据组 parent=${parentCid}`);
       continue;
     }
@@ -224,7 +274,7 @@ function groupFiles(files, cfg) {
     groups.push({ kind: 'folder', parentCid, folderName, videos, metas });
   }
 
-  // Subgroup root-level files by parsed (title, year)
+  // 根级散文件按 (title|year) 进一步分组
   for (const subgroup of subgroupRootFiles(rootFiles, cfg)) {
     groups.push({ kind: 'root', parentCid: cfg.source_cid, folderName: '', ...subgroup });
   }
@@ -232,12 +282,16 @@ function groupFiles(files, cfg) {
   return groups.filter(g => g.videos.length > 0);
 }
 
+/**
+ * 把根级散文件按文件名解析出的 (title, year) 聚合成桶。
+ * 元数据通过文件名"主干前缀互相包含"匹配到对应视频桶；都没匹配上且只有一个桶时挂到该桶。
+ */
 function subgroupRootFiles(files, cfg) {
   const videos = files.filter(f => f._isVideo);
   const metas = files.filter(f => f._isMeta);
   if (!videos.length) return [];
 
-  // Parse each video; group by (title|year). When parse fails, fall back to per-file group.
+  // 用 (title|year) 做分桶 key。解析失败时退化为按文件名独立成组。
   const buckets = new Map();
   for (const v of videos) {
     const p = parseFilename(v.name);
@@ -246,7 +300,7 @@ function subgroupRootFiles(files, cfg) {
     buckets.get(key).videos.push(v);
   }
 
-  // Attach metas by stem-prefix match against any video in a bucket
+  // 元数据按文件名 stem 前缀挂到对应视频桶
   for (const m of metas) {
     const stem = stemOf(m.name).toLowerCase();
     let hit = null;
@@ -256,7 +310,7 @@ function subgroupRootFiles(files, cfg) {
         return stem.startsWith(vs) || vs.startsWith(stem);
       })) { hit = b; break; }
     }
-    // Fallback: attach to the first bucket if we couldn't match (best-effort).
+    // 单桶兜底：找不到精确匹配时把元数据挂到唯一桶
     if (!hit && buckets.size === 1) hit = [...buckets.values()][0];
     if (hit) hit.metas.push(m);
   }
@@ -264,15 +318,29 @@ function subgroupRootFiles(files, cfg) {
   return [...buckets.values()];
 }
 
+/**
+ * 给一个组生成可读标签，用于日志/通知（优先文件夹名，否则首个视频名）。
+ */
 function groupLabel(g) {
   return g.folderName || g.videos[0]?.name || `parent=${g.parentCid}`;
 }
 
-// ----- Identification -----
+// ===== 识别 =====
 
+/**
+ * 对一个媒体单元做综合识别：本地文件名解析 → TMDB 搜索 → AI 兜底。
+ *
+ * 关键设计：
+ * - 解析名字池 = 所有祖先目录名 + 所有视频文件名。最顶层的目录名（如"庆余年.S01.全集"）
+ *   通常含最干净的标题，胜过单文件名。
+ * - 通过 pickBestParsed 综合打分挑出一份"主版本"信息；季号取任一文件解析到的非空值。
+ * - 结构启发式只在没有显式 tmdbId 时才允许把媒体类型翻转为 tv，避免"电影 (年) {tmdb-xxx}"
+ *   配着花絮被误判为剧集。
+ * - TMDB / AI 是各自独立的可关闭兜底；AI 拿到 tmdbId 后还会回头再走一次 TMDB 拿详情。
+ * - 最终用 tmdbDetails 判断是否为动漫（Genre=Animation）并刷新 title/year。
+ */
 async function identifyGroup(group, cfg) {
-  // Pool of filenames to parse: include all ancestor directory names + video filenames.
-  // The topmost ancestor (e.g. "庆余年.S01.全集") usually has the cleanest title.
+  // 收集所有可用作输入的字符串：祖先目录名 + 文件夹名 + 视频文件名
   const ancestorNames = new Set();
   for (const v of group.videos) {
     if (Array.isArray(v.pathSegs)) {
@@ -283,31 +351,29 @@ async function identifyGroup(group, cfg) {
   const names = [...ancestorNames, ...group.videos.map(v => v.name)].filter(Boolean);
   const parsedAll = names.map(n => parseFilename(n));
 
-  // Merge: pick title/year from the most-informative entry, but keep per-file S/E.
+  // 综合打分挑出最佳标题/年份/类型；季号从任一解析项取非空。
   const merged = pickBestParsed(parsedAll, group);
 
-  // Structural hint for media type.
-  // Only let the heuristic flip to TV when we DON'T already have a tmdbId/mediaType from
-  // parsing — a folder named "Movie (Year) {tmdb-XXX}" with a featurette next to the main
-  // file otherwise gets mis-classified as TV just because videoFiles.length > 1.
+  // 媒体类型的结构启发式：仅当未拿到 tmdbId 时允许翻转为 tv。
   const videoExts = new Set(parseExts(cfg.video_extensions, VIDEO_EXTS_DEFAULT));
   const struct = detectMediaTypeFromStructure(group.videos.map(v => v.name), group.folderName, videoExts);
   if (struct === 'tv' && !merged.tmdbId) {
     merged.mediaType = 'tv';
   }
 
-  // 4.6.2: TMDB search if we lack tmdbId
+  // 4.6.2：若无 tmdbId 但有 title，则走 TMDB 搜索
   if (!merged.tmdbId && merged.title) {
     const tmdb = await resolveViaTmdb(merged);
     if (tmdb) Object.assign(merged, tmdb);
   }
 
-  // 4.6.3: AI fallback when TMDB still empty
+  // 4.6.3：仍无 tmdbId 且 AI 已启用 → 走 AI 兜底
   if (!merged.tmdbId && cfg.ai_enabled) {
     try {
       const seed = group.folderName || group.videos[0]?.name;
       const ai = await aiIdentify(seed);
       if (ai) {
+        // AI 仅补齐尚未确定的字段，避免覆盖前面已识别到的
         if (ai.title && !merged.title) merged.title = ai.title;
         if (ai.year && !merged.year) merged.year = String(ai.year);
         if (ai.tmdbId && !merged.tmdbId) merged.tmdbId = ai.tmdbId;
@@ -315,6 +381,7 @@ async function identifyGroup(group, cfg) {
         if (ai.episode != null && merged.episode == null) merged.episode = Number(ai.episode);
         if (ai.mediaType && !merged.mediaType) merged.mediaType = ai.mediaType;
         merged.identifySource = 'ai';
+        // AI 给出 tmdbId 后再回头拉详情，借用 TMDB 的权威信息覆盖
         if (ai.tmdbId) {
           const t = await resolveViaTmdb(merged);
           if (t) Object.assign(merged, t);
@@ -325,7 +392,7 @@ async function identifyGroup(group, cfg) {
     }
   }
 
-  // Make sure we have details for region classification + anime check.
+  // 确保拿到 details 用于地区分类与动漫判定
   if (merged.tmdbId && !merged.tmdbDetails) {
     try {
       merged.tmdbDetails = merged.mediaType === 'movie'
@@ -347,17 +414,19 @@ async function identifyGroup(group, cfg) {
   return merged;
 }
 
+/**
+ * 给多份解析结果打分，挑出"最有信息量"的一份。
+ * 打分项：title(+2)、year(+2)、season(+1)、episode(+1)。
+ * 季号最终从任一解析项中取非空；tmdbId 从任一显式标注的解析项取（如 "...[tmdb-575219]"）。
+ */
 function pickBestParsed(parsedAll, group) {
-  // Score by presence of title + year; tie-break by S/E presence.
   const scored = parsedAll.map(p => ({
     p,
     score: (p.title ? 2 : 0) + (p.year ? 2 : 0) + (p.season != null ? 1 : 0) + (p.episode != null ? 1 : 0),
   }));
   scored.sort((a, b) => b.score - a.score);
   const top = scored[0]?.p || parsedAll[0] || {};
-  // For TV-ish groups, we keep season from whichever video had it.
   const seasonFromAny = parsedAll.find(p => p.season != null)?.season ?? null;
-  // Pick up an explicit TMDB id from whichever parsed name carried it (e.g. "... [tmdb-575219]").
   const tmdbIdFromAny = parsedAll.find(p => p.tmdbId)?.tmdbId ?? null;
   return {
     title: top.title || '',
@@ -370,8 +439,14 @@ function pickBestParsed(parsedAll, group) {
   };
 }
 
+/**
+ * 通过 TMDB 解析媒体信息。
+ * 优先按解析出的 mediaType 调具体接口（movie / tv），再用 multi 兜底。
+ * 拿到候选后用 pickBestTmdb 选出最佳匹配，再拉 details，最后归并出业务侧字段。
+ *
+ * @returns {Promise<Object|null>} 含 title/year/tmdbId/mediaType/tmdbDetails 的对象；全部失败返回 null
+ */
 async function resolveViaTmdb(info) {
-  // Try the type the parser suggested first; fall back to multi.
   const queries = [];
   if (info.mediaType === 'movie') queries.push(['movie']);
   else if (info.mediaType === 'tv' || info.mediaType === 'anime') queries.push(['tv']);
@@ -385,7 +460,6 @@ async function resolveViaTmdb(info) {
       else results = await searchMulti(info.title, info.year);
       results = results.filter(r => r.media_type === 'movie' || r.media_type === 'tv');
       if (!results.length) continue;
-      // Pick best: prefer year match
       const best = pickBestTmdb(results, info);
       if (!best) continue;
       const detail = best.media_type === 'movie'
@@ -407,9 +481,12 @@ async function resolveViaTmdb(info) {
   return null;
 }
 
+/**
+ * 从 TMDB 候选里选出"最像目标"的一条。
+ * 打分：年份完全匹配 +3；标题完全相等 +3；标题互相包含 +1；流行度归一化 +0~2（最多 2 分）。
+ */
 function pickBestTmdb(results, info) {
   const wantedYear = info.year ? String(info.year) : '';
-  // Score: year exact (3), title contains (2), popularity tiebreak.
   const scored = results.map(r => {
     const y = (r.release_date || r.first_air_date || '').slice(0, 4);
     let score = 0;
@@ -425,18 +502,23 @@ function pickBestTmdb(results, info) {
   return scored[0]?.r;
 }
 
-// ----- Process a single group -----
+// ===== 处理单个组 =====
 
+/**
+ * 单个媒体单元的处理入口：识别 → 校验 → 分流到 movie/TV 流程。
+ *
+ * 校验策略：仅 title 是硬性必填；缺 year/tmdbId 时再以空年份做一次 TMDB 搜索补齐；
+ * 仍然没有也允许走下游（具体流程会按需求决定是否跳过）。
+ */
 async function processGroup(group, cfg, taskId, stats, cancel, episodeSummary) {
   const id = await identifyGroup(group, cfg);
 
-  // 只有 title 是硬性要求；year/tmdbId 缺失时让下游按空值继续走流程。
   if (!id.title) {
     await pushUnmatched(group, id, '缺少必要字段 (title)');
     stats.skip++;
     return;
   }
-  //使用title调用tmdb接口：缺tmdbId补齐tmdbId，缺失year的，补齐year
+  // 缺 tmdbId 或 year 时，用 title 再做一次 TMDB 兜底
   if (!id.tmdbId || !id.year) {
     const tmdb = await resolveViaTmdb({ ...id, year: '' });
     if (tmdb) {
@@ -448,13 +530,17 @@ async function processGroup(group, cfg, taskId, stats, cancel, episodeSummary) {
   }
 
   if (id.mediaType === 'tv' || id.mediaType === 'anime') {
-    // For TV: missing season/episode is OK at group level, but each video must have S+E.
+    // 剧集允许 group 级缺 S/E，但每个视频必须能解析出自己的 S/E
     await processTVGroup(group, id, cfg, taskId, stats, cancel, episodeSummary);
   } else {
     await processMovieGroup(group, id, cfg, taskId, stats);
   }
 }
 
+/**
+ * 把识别失败的组写入 unmatched_items 表，等待用户手动处理（4.13 流程）。
+ * 同时记录 file_ids 列表，便于后续 resolveUnmatched 重建组结构。
+ */
 async function pushUnmatched(group, id, reason) {
   const db = getDb();
   const fileIds = [...group.videos, ...group.metas].map(f => ({ id: f.id, name: f.name, size: f.size, isVideo: f._isVideo }));
@@ -472,6 +558,12 @@ async function pushUnmatched(group, id, reason) {
   logger.warn('Organizer', `加入识别失败队列: ${groupLabel(group)} - ${reason}`);
 }
 
+/**
+ * 根据识别结果决定目标分类路径段数组：
+ * - 一级：电影 / 剧集 / 动漫
+ * - 二级（可选）：地区分类（动漫走 classifyAnimeRegion，其余走 classifyRegion）
+ * - 三级（可选）：年份
+ */
 function classifyTargetPath(id, cfg) {
   let region = '其他';
   if (cfg.secondary_category && id.tmdbDetails) {
@@ -488,15 +580,23 @@ function classifyTargetPath(id, cfg) {
   return segs;
 }
 
-// ----- Movie -----
+// ===== 电影分支 =====
 
+/**
+ * 处理"识别为电影"的组：
+ * 1) 算出分类路径、确保分类目录存在；
+ * 2) 为每个视频独立提取技术规格 + 生成命名；
+ * 3) 通过 tmdbId 复用已有电影文件夹（或按首个视频的 folderName 新建一个）；
+ * 4) 逐视频走 placeVideo（多版本/同名冲突在那里处理）；
+ * 5) 写入 task_items；
+ * 6) 启用通知则发送成功通知。
+ */
 async function processMovieGroup(group, id, cfg, taskId, stats) {
-  // For each video in the group, decide multi-version vs single. Metas tag along by stem-prefix.
   const cache = cfg._targetCache || null;
   const categoryPath = classifyTargetPath(id, cfg);
   const catCid = await ensureFolderPath(cfg.target_cid, categoryPath, cache);
 
-  // For each video: extract per-file media info, build name
+  // 为每个视频独立计算技术规格 + 命名
   const videoUnits = [];
   for (const v of group.videos) {
     const parsed = parseFilename(v.name);
@@ -506,7 +606,7 @@ async function processMovieGroup(group, id, cfg, taskId, stats) {
     videoUnits.push({ video: v, mediaInfo, folderName, fileName });
   }
 
-  // Multi-version: dedupe by tmdb_id across videos AND existing library
+  // 用首个视频生成的 folderName 作为"代表名"；若已有同 tmdbId 的文件夹则复用
   const winningFileName = videoUnits[0].folderName;
   const movieType = id.mediaType === 'anime' ? 'anime' : 'movie';
   const movieFolderCid = (await findExistingShowCid(id.tmdbId, movieType, catCid, cache))
@@ -558,10 +658,19 @@ async function processMovieGroup(group, id, cfg, taskId, stats) {
   }
 }
 
-// ----- TV / anime -----
+// ===== 剧集 / 动漫分支 =====
 
+/**
+ * 处理"识别为剧集/动漫"的组：
+ * 1) 为每个视频解析 S/E（缺一不可，缺则进入未匹配队列）；
+ * 2) 算分类路径与剧目录（可复用已有的 tmdbId 文件夹）；
+ * 3) 按季缓存 seasonCid，避免重复创建；
+ * 4) 逐集走 placeVideo，匹配对应字幕等元数据；
+ * 5) 记录 task_items；
+ * 6) episode_per_notify 模式下逐集通知，否则把入库的集合并到 episodeSummary 留待结尾统一通知。
+ */
 async function processTVGroup(group, id, cfg, taskId, stats, cancel, episodeSummary) {
-  // Build per-episode work items: each video gets its own S/E.
+  // 解析每个视频的 S/E（可被 group 级 season 兜底）
   const episodes = [];
   for (const v of group.videos) {
     const parsed = parseFilename(v.name);
@@ -585,7 +694,7 @@ async function processTVGroup(group, id, cfg, taskId, stats, cancel, episodeSumm
   }
   if (!episodes.length) return;
 
-  // Compute target paths once for the show
+  // 确保剧目录存在（优先复用已有 tmdbId 文件夹）
   const cache = cfg._targetCache || null;
   const categoryPath = classifyTargetPath(id, cfg);
   const catCid = await ensureFolderPath(cfg.target_cid, categoryPath, cache);
@@ -594,6 +703,7 @@ async function processTVGroup(group, id, cfg, taskId, stats, cancel, episodeSumm
   const showCid = (await findExistingShowCid(id.tmdbId, id.mediaType, catCid, cache))
     ?? await getOrCreateChildFolder(catCid, showFolderName, cache);
 
+  // 季目录缓存：避免逐集重复 ensure
   const seasonsCache = new Map();
   const summaryItems = [];
 
@@ -607,7 +717,7 @@ async function processTVGroup(group, id, cfg, taskId, stats, cancel, episodeSumm
     }
     const { episodeName } = generateTVNames(id, ep.mediaInfo, ep.season, ep.episode, ep.episodeEnd);
 
-    // Find metas that match this episode (by S/E or by stem prefix)
+    // 字幕等元数据按 S/E 或 stem 前缀匹配到本集
     const epMetas = matchMetasToEpisode(ep, group.metas);
 
     const result = await placeVideo({
@@ -662,6 +772,7 @@ async function processTVGroup(group, id, cfg, taskId, stats, cancel, episodeSumm
     }
   }
 
+  // 非逐集通知模式：把本组的入库集次累加到全局 summary，待 runOrganize 结尾统一发
   if (cfg.notify_enabled && !cfg.episode_per_notify && summaryItems.length) {
     const key = `${id.tmdbId}`;
     if (!episodeSummary.has(key)) {
@@ -678,26 +789,47 @@ async function processTVGroup(group, id, cfg, taskId, stats, cancel, episodeSumm
   }
 }
 
+/**
+ * 把元数据文件（字幕/nfo 等）匹配到具体集。
+ * 优先按解析出来的 S/E 严格相等；否则按 stem 前缀互相包含兜底。
+ */
 function matchMetasToEpisode(ep, allMetas) {
   return allMetas.filter(m => {
     const parsed = parseFilename(m.name);
     if (parsed.season != null && parsed.episode != null) {
       return parsed.season === ep.season && parsed.episode === ep.episode;
     }
-    // Fallback: stem prefix
     const vs = stemOf(ep.video.name);
     const ms = stemOf(m.name);
     return ms.startsWith(vs) || vs.startsWith(ms);
   });
 }
 
-// ----- Common: place one video + its metas into target, with conflict / multi-version handling -----
+// ===== 通用：单视频 + 元数据落位 =====
 
+/**
+ * 把单个视频（与其元数据）落位到目标目录，处理多版本与同名冲突。
+ *
+ * 流程：
+ * 1) resolveMultiVersion 与媒体库已有版本对比：
+ *    - 新文件落败 → 回收新文件；
+ *    - 新文件胜出 → 回收旧版本并删除其 media_library 行；
+ *    - 平手或保持现状 → 继续。
+ * 2) 目标目录内同名文件冲突：
+ *    - mode=2 跳过；
+ *    - 启用 multi_version：用 v2 / v3 后缀避开；
+ *    - 否则按 mode=0/1 决定保大或保小；
+ * 3) 预先计算所有元数据的新名（启用重命名时按字幕语言加后缀）；
+ * 4) 一次性批量 move（视频 + 全部元数据），失败回退逐个；
+ * 5) 一次性批量 rename，同样回退；
+ * 6) 写入 media_library 便于后续多版本比对；
+ * 7) 返回 'placed' / 'skipped' / 'recycled'。
+ */
 async function placeVideo({ video, mediaInfo, id, targetCid, showCid, baseName, cfg, metas, mediaType, season, episode }) {
   const db = getDb();
   const ext = extOf(video.name);
 
-  // Multi-version comparison against existing library entries.
+  // 多版本判定
   const versionDecision = await resolveMultiVersion({
     mediaType: mediaType === 'anime' ? 'anime' : mediaType,
     tmdbId: id.tmdbId,
@@ -707,12 +839,14 @@ async function placeVideo({ video, mediaInfo, id, targetCid, showCid, baseName, 
     cfg,
   });
   if (versionDecision.action === 'recycleIncoming') {
+    // 新文件落败：回收并记录
     try { await moveToRecycle(video.id); } catch (err) { logger.warn('Organizer', '回收新文件失败', err.message); }
     db.prepare(`INSERT INTO recycle_records (source_path, file_id, file_size, winner_path, winner_size, loser_to, reason)
       VALUES (?,?,?,?,?,?,?)`).run(video.name, video.id, video.size, versionDecision.winnerPath || '', versionDecision.winnerSize || 0, '', '多版本-体积/规格较低');
     return 'recycled';
   }
   if (versionDecision.action === 'recycleExisting') {
+    // 旧版本落败：批量回收并清掉 media_library 中对应行
     const loserIds = versionDecision.losers.map(o => o.file_id).filter(Boolean);
     if (loserIds.length) {
       try { await moveToRecycleBatch(loserIds); }
@@ -725,11 +859,10 @@ async function placeVideo({ video, mediaInfo, id, targetCid, showCid, baseName, 
     }
   }
 
-  // True same-name conflict resolution (conflict_mode)
+  // 同名冲突处理
   let placedName = baseName + '.' + ext;
   let multiSuffixN = 1;
 
-  // Check for an existing same-named file inside the target folder.
   const targetExisting = await listFolder(targetCid, { onlyFolders: false }).catch(() => []);
   let conflict = targetExisting.find(it => !it.isFolder && it.name === placedName);
 
@@ -739,7 +872,7 @@ async function placeVideo({ video, mediaInfo, id, targetCid, showCid, baseName, 
       return 'skipped';
     }
     if (cfg.multi_version) {
-      // Differentiate via multi-version suffix
+      // 用 v2/v3 后缀避开重名（每存在一个同名版本就递增）
       while (conflict) {
         multiSuffixN++;
         const suffix = buildMultiVersionSuffix(multiSuffixN);
@@ -747,7 +880,7 @@ async function placeVideo({ video, mediaInfo, id, targetCid, showCid, baseName, 
         conflict = targetExisting.find(it => !it.isFolder && it.name === placedName);
       }
     } else {
-      // Compare sizes per cfg.conflict_mode (0 small-wins, 1 big-wins)
+      // 单版本模式：按 conflict_mode 决定保大(1)或保小(0)
       const winsBig = cfg.conflict_mode === 1;
       const incomingSize = video.size;
       const existingSize = conflict.size;
@@ -756,12 +889,12 @@ async function placeVideo({ video, mediaInfo, id, targetCid, showCid, baseName, 
         try { await moveToRecycle(video.id); } catch {}
         return 'recycled';
       }
-      // Incoming wins: recycle the existing
+      // 新文件胜出 → 回收旧文件
       try { await moveToRecycle(conflict.id); } catch (err) { logger.warn('Organizer', '回收同名文件失败', err.message); }
     }
   }
 
-  // Pre-compute meta target names so we can batch move + batch rename.
+  // 预先计算元数据新名（要带字幕语言后缀）
   const metaPlan = metas.map(m => {
     const mExt = extOf(m.name);
     let metaName;
@@ -776,12 +909,12 @@ async function placeVideo({ video, mediaInfo, id, targetCid, showCid, baseName, 
     return { id: m.id, name: m.name, newName: metaName };
   });
 
-  // Batch move: video + all metas in a single 115 call.
+  // 一次性批量移动（视频 + 所有元数据）
   const moveIds = [video.id, ...metaPlan.map(m => m.id)];
   try {
     await moveFiles(moveIds, targetCid);
   } catch (err) {
-    // Fall back to per-file moves so a single bad fid doesn't sink the whole group.
+    // 整批失败回退逐个，避免单条坏 id 拖垮整组
     logger.warn('Organizer', `批量移动失败，回退逐个: ${err.message}`);
     try { await moveFile(video.id, targetCid); }
     catch (e) { logger.warn('Organizer', `视频移动失败: ${video.name}`, e.message); }
@@ -791,7 +924,7 @@ async function placeVideo({ video, mediaInfo, id, targetCid, showCid, baseName, 
     }
   }
 
-  // Batch rename: video + metas in a single 115 call.
+  // 一次性批量重命名
   if (cfg.rename_enabled) {
     const renamePairs = [[video.id, placedName], ...metaPlan.map(m => [m.id, m.newName])];
     try {
@@ -807,7 +940,8 @@ async function placeVideo({ video, mediaInfo, id, targetCid, showCid, baseName, 
     }
   }
 
-  // Record into media_library
+  // 写入 media_library 表（多版本比对依赖它）。
+  // dolby 字段为冗余 boolean 简化查询：音频编码含 truehd/atmos/dolby 视为杜比。
   try {
     db.prepare(`INSERT OR REPLACE INTO media_library
       (media_type, tmdb_id, season, episode, target_cid, show_cid, file_id, file_path, file_size,
@@ -832,9 +966,14 @@ async function placeVideo({ video, mediaInfo, id, targetCid, showCid, baseName, 
     logger.debug('Organizer', `media_library 写入失败: ${err.message}`);
   }
 
+  const seLabel = (season != null && episode != null) ? ` S${String(season).padStart(2,'0')}E${String(episode).padStart(2,'0')}` : '';
+  logger.info('Organizer', `已入库${seLabel}: ${placedName} → cid=${targetCid}`);
   return 'placed';
 }
 
+/**
+ * 取或建子目录。优先用 cache 命中；命中后直接返回，未命中才走 createFolder 并同步入 cache。
+ */
 async function getOrCreateChildFolder(parentCid, name, cache = null) {
   const existing = await findFolderByName(parentCid, name, cache);
   if (existing) return existing;
@@ -843,13 +982,15 @@ async function getOrCreateChildFolder(parentCid, name, cache = null) {
   return created.cid;
 }
 
-// Two-stage lookup for an existing show/movie folder by tmdbId:
-// 1. Query media_library (covers files organised by this system)
-// 2. Scan the 115 category folder for a subfolder whose name contains "tmdb-{tmdbId}"
-//    (covers pre-existing folders organised manually or by other tools that follow the
-//    default naming convention  "{title} ({year}) {tmdb-{tmdbId}}")
+/**
+ * 通过 tmdbId 找已有的电影/剧目录。两阶段查找：
+ * 1) media_library 命中（本系统整理过的文件）；
+ * 2) 在分类目录下扫描子目录名包含 "tmdb-{tmdbId}" 的（兼容手工/其他工具按默认命名预先建好的目录）。
+ *
+ * 缓存命中：直接遍历 catNode.children，无任何 API 调用。
+ */
 async function findExistingShowCid(tmdbId, mediaType, catCid, cache = null) {
-  // Stage 1: local DB
+  // 阶段 1：本地 DB。动漫还兼查 tv 类型（动漫可能被早期版本标记为 tv）
   const db = getDb();
   const types = mediaType === 'anime' ? ['anime', 'tv'] : [mediaType];
   for (const t of types) {
@@ -862,7 +1003,7 @@ async function findExistingShowCid(tmdbId, mediaType, catCid, cache = null) {
     }
   }
 
-  // Stage 2: scan 115 category folder for "tmdb-{tmdbId}" in folder name
+  // 阶段 2：扫描分类目录，看是否已有 "tmdb-{tmdbId}" 标记的子目录
   const marker = `tmdb-${tmdbId}`;
   if (cache) {
     const catNode = cache.byId.get(String(catCid));
@@ -890,25 +1031,42 @@ async function findExistingShowCid(tmdbId, mediaType, catCid, cache = null) {
   return null;
 }
 
-// ----- Multi-version resolution -----
+// ===== 多版本判定 =====
 
-// resolution-priority compares numeric value: 2160 > 1080 > 720 etc.
+/**
+ * 把分辨率串（如 "1080p"）转为可比较的数值（提取首段数字）。
+ * 无法识别返回 0。
+ */
 function resolutionScore(r) {
   if (!r) return 0;
   const m = String(r).match(/(\d+)/);
   return m ? parseInt(m[1]) : 0;
 }
 
+/** Remux/BluRay 类高码率源头判定。 */
 function isRemuxLike(info) {
   return /remux|bluray|blu-ray/i.test(info?.source || '');
 }
 
+/** 含 TrueHD/Atmos/Dolby 字样视为杜比音轨。 */
 function hasDolby(info) {
   return /truehd|atmos|dolby/i.test(info?.audioCodec || '');
 }
 
+/**
+ * 多版本决策器。
+ * 在 media_library 中查找同 (mediaType, tmdbId, season, episode) 已有记录：
+ * - conflict_mode=2（跳过模式）→ 不做多版本处理；
+ * - cfg.multi_version=true（保留所有版本）→ 不做处理，依靠后续多版本后缀避免重名；
+ * - 否则单版本模式：用 pickVersionWinner 逐个对比，决定回收新文件还是回收旧版本。
+ *
+ * 结果 action 取值：
+ * - 'none'：无需处理
+ * - 'recycleIncoming'：回收新文件（保留旧版本）
+ * - 'recycleExisting'：回收旧版本列表（保留新文件）
+ */
 async function resolveMultiVersion({ mediaType, tmdbId, season, episode, incoming, cfg }) {
-  if (cfg.conflict_mode === 2) return { action: 'none' }; // skip mode disables version handling
+  if (cfg.conflict_mode === 2) return { action: 'none' };
   const db = getDb();
   const existing = db.prepare(
     `SELECT * FROM media_library WHERE media_type=? AND tmdb_id=? AND season IS ? AND episode IS ?`
@@ -916,10 +1074,10 @@ async function resolveMultiVersion({ mediaType, tmdbId, season, episode, incomin
 
   if (!existing.length) return { action: 'none' };
 
-  // Multi-version keep all: leave both, naming differentiates them.
+  // 多版本保留所有：交由命名后缀解决
   if (cfg.multi_version) return { action: 'none' };
 
-  // Single-version mode: keep the strongest. Compare incoming vs each existing.
+  // 单版本模式：保留最强版本
   const inc = incoming.info || {};
   const losers = [];
   let incomingWins = true;
@@ -933,11 +1091,11 @@ async function resolveMultiVersion({ mediaType, tmdbId, season, episode, incomin
     const winner = pickVersionWinner(inc, exInfo, cfg, incoming.size, ex.file_size);
     if (winner === 'incoming') losers.push(ex);
     else if (winner === 'existing') incomingWins = false;
-    // 'tie' is treated as keep-existing
+    // 'tie' 视为保留现状
     else incomingWins = false;
   }
   if (!incomingWins) {
-    // Pick the strongest existing as the winner to record
+    // 记录获胜的旧版本路径，方便日志展示
     const top = existing[0];
     return {
       action: 'recycleIncoming',
@@ -949,6 +1107,14 @@ async function resolveMultiVersion({ mediaType, tmdbId, season, episode, incomin
   return { action: 'none' };
 }
 
+/**
+ * 两个版本一一对比胜负，按优先级链：
+ * 1) remux_priority：Remux/BluRay 优先；
+ * 2) resolution_priority：分辨率高者胜；
+ * 3) dolby_priority：含杜比音轨者胜；
+ * 4) 体积兜底：按 conflict_mode（0=保小，1=保大）；
+ * 5) 完全相同 → 'tie'。
+ */
 function pickVersionWinner(a, b, cfg, aSize, bSize) {
   if (cfg.remux_priority) {
     const ra = isRemuxLike(a), rb = isRemuxLike(b);
@@ -962,7 +1128,6 @@ function pickVersionWinner(a, b, cfg, aSize, bSize) {
     const da = hasDolby(a), db_ = hasDolby(b);
     if (da !== db_) return da ? 'incoming' : 'existing';
   }
-  // Tie-break by size per conflict_mode: 0 = small wins, 1 = big wins
   if (aSize !== bSize) {
     if (cfg.conflict_mode === 1) return aSize > bSize ? 'incoming' : 'existing';
     return aSize < bSize ? 'incoming' : 'existing';
@@ -970,8 +1135,11 @@ function pickVersionWinner(a, b, cfg, aSize, bSize) {
   return 'tie';
 }
 
-// ----- ffprobe helper -----
+// ===== ffprobe 辅助 =====
 
+/**
+ * 调用 ffprobe 抽取媒体技术规格。未启用或失败时返回空对象，不打断流程。
+ */
 async function extractMediaInfo(video, cfg) {
   if (!cfg.ffprobe_enabled) return {};
   try {
@@ -982,7 +1150,10 @@ async function extractMediaInfo(video, cfg) {
   }
 }
 
-// Merge filename-parsed info with ffprobe results: ffprobe wins where it has a value.
+/**
+ * 将文件名解析结果与 ffprobe 结果合并：ffprobe 有值的字段覆盖文件名解析的同名字段。
+ * 用于把权威技术规格写入命名变量。
+ */
 function mergeMediaInfo(parsed, probe) {
   const out = { ...parsed };
   for (const [k, v] of Object.entries(probe || {})) {
@@ -991,8 +1162,12 @@ function mergeMediaInfo(parsed, probe) {
   return out;
 }
 
-// ----- task_items helper -----
+// ===== task_items 写入 =====
 
+/**
+ * 把一条入库结果写入 task_items（运行日志/详情表）。
+ * 容错地兜底所有字段，缺失字段以合理默认值代入，避免 NOT NULL 约束爆错。
+ */
 function recordTaskItem(taskId, row) {
   const db = getDb();
   db.prepare(`INSERT INTO task_items
@@ -1023,8 +1198,18 @@ function recordTaskItem(taskId, row) {
     });
 }
 
-// ----- Re-organize an existing task in place (4.12) -----
+// ===== 重新整理已有任务（4.12） =====
 
+/**
+ * 基于一个旧任务的 task_items，重新按当前 TMDB 信息与命名模板把文件移动/重命名到合适位置。
+ *
+ * 适用场景：
+ * - 改了命名模板想全库刷新；
+ * - 上次整理时 TMDB 元数据不完整，重新拉详情后重组目录结构；
+ * - 二级/三级分类配置变化。
+ *
+ * 注意：不会重新走完整识别流程；mediaType 取自历史记录，仅刷新 TMDB 详情决定分类目录。
+ */
 export async function rerunInPlace(originalTaskId) {
   const db = getDb();
   const original = db.prepare('SELECT * FROM tasks WHERE id=?').get(originalTaskId);
@@ -1040,7 +1225,7 @@ export async function rerunInPlace(originalTaskId) {
   const cancel = getCancelToken(newTaskId);
   const stats = { scan: items.length, success: 0, fail: 0, skip: 0 };
 
-  // Group items by media (tmdbId, mediaType) - we re-classify/re-rename in their CURRENT location.
+  // 逐条重跑：在文件当前位置重新决定目标路径与命名
   try {
     for (const item of items) {
       if (cancel.cancelled) break;
@@ -1049,7 +1234,7 @@ export async function rerunInPlace(originalTaskId) {
           title: '', year: '', tmdbId: item.tmdb_id, mediaType: item.media_type,
           identifySource: 'rerun',
         };
-        // Fetch fresh details for re-classification
+        // 拉一次最新 TMDB 详情用于重新分类
         if (id.tmdbId) {
           id.tmdbDetails = id.mediaType === 'movie'
             ? await getMovieDetails(id.tmdbId)
@@ -1062,7 +1247,7 @@ export async function rerunInPlace(originalTaskId) {
         }
         if (!id.title || !id.year || !id.tmdbId) { stats.skip++; continue; }
 
-        // Determine new target path
+        // 算新目标目录
         const cache = cfg._targetCache || null;
         const categoryPath = classifyTargetPath(id, cfg);
         const catCid = await ensureFolderPath(cfg.target_cid, categoryPath, cache);
@@ -1098,8 +1283,14 @@ export async function rerunInPlace(originalTaskId) {
   return { taskId: newTaskId, stats };
 }
 
-// ----- Resolve an unmatched item manually (4.13) -----
+// ===== 手动解析未匹配条目（4.13） =====
 
+/**
+ * 用户在 Web 端手动指定 TMDB 元数据后，把对应未匹配条目下的文件按指定信息入库。
+ *
+ * @param {number} unmatchedId unmatched_items 主键
+ * @param {Object} payload 用户提交的元数据 { title, year, tmdbId, mediaType, season?, episode?, episodeEnd? }
+ */
 export async function resolveUnmatched(unmatchedId, payload) {
   const db = getDb();
   const item = db.prepare('SELECT * FROM unmatched_items WHERE id=?').get(unmatchedId);
@@ -1116,7 +1307,7 @@ export async function resolveUnmatched(unmatchedId, payload) {
     mediaType: payload.mediaType || 'movie',
     identifySource: 'manual',
   };
-  // Fetch TMDB details if we have an id
+  // 用户提供了 tmdbId 时，从 TMDB 拉详情补齐 title/year，并按 Genre 判定动漫
   if (id.tmdbId) {
     id.tmdbDetails = id.mediaType === 'movie'
       ? await getMovieDetails(id.tmdbId)
@@ -1129,14 +1320,14 @@ export async function resolveUnmatched(unmatchedId, payload) {
   }
   if (!id.title || !id.year || !id.tmdbId) throw new Error('必填字段缺失 (title/year/tmdbId)');
 
-  // Build group from stored files
+  // 把存档的 file_ids 还原成组结构（与 runOrganize 中分组后的 group 同形）
   const videos = files.filter(f => f.isVideo).map(f => ({ id: f.id, name: f.name, size: f.size, parentCid: item.parent_cid, _isVideo: true }));
   const metas = files.filter(f => !f.isVideo).map(f => ({ id: f.id, name: f.name, size: f.size, parentCid: item.parent_cid, _isMeta: true }));
   if (!videos.length) throw new Error('该条目下没有视频文件');
 
   const group = { kind: 'manual', parentCid: item.parent_cid, folderName: item.source_name, videos, metas };
 
-  // Inline a new task to wrap the work
+  // 包一个独立 task 行用于记录这次手动处理
   const taskRow = db.prepare("INSERT INTO tasks (status, started_at) VALUES ('running', datetime('now','localtime'))").run();
   const taskId = taskRow.lastInsertRowid;
   const stats = { scan: videos.length, success: 0, fail: 0, skip: 0 };
@@ -1144,8 +1335,8 @@ export async function resolveUnmatched(unmatchedId, payload) {
   const cancel = getCancelToken(taskId);
 
   try {
-    // For TV: allow caller to provide explicit season/episode that overrides parsed
     if (id.mediaType === 'tv' || id.mediaType === 'anime') {
+      // 剧集允许用户传入 season/episode 覆盖单文件解析失败的情况
       const overrides = { season: payload.season, episode: payload.episode, episodeEnd: payload.episodeEnd };
       await processTVManual(group, id, cfg, taskId, stats, cancel, overrides, episodeSummary);
     } else {
@@ -1161,8 +1352,11 @@ export async function resolveUnmatched(unmatchedId, payload) {
   return { taskId, stats };
 }
 
+/**
+ * processTVGroup 的手动版：允许 overrides.season/episode 在解析失败时兜底。
+ * 其余逻辑（季缓存、命名生成、placeVideo、通知）与 processTVGroup 一致。
+ */
 async function processTVManual(group, id, cfg, taskId, stats, cancel, overrides, episodeSummary) {
-  // Build per-episode list using overrides where parsing falls short.
   const episodes = [];
   for (const v of group.videos) {
     if (cancel.cancelled) break;
@@ -1262,8 +1456,13 @@ async function processTVManual(group, id, cfg, taskId, stats, cancel, overrides,
   }
 }
 
-// ----- Clean up empty folders -----
+// ===== 清理空目录 =====
 
+/**
+ * 清理空目录的入口。优先快速路径，失败回退慢速路径。
+ * 快速路径只能识别"子树内一个媒体文件都没有"的空分支；
+ * 慢速路径还能识别"残留少量非媒体垃圾"的目录（用 isMedia 判别）。
+ */
 async function cleanupEmptyFolders(rootCid) {
   const cfg = getConfig();
   const videoExts = new Set(parseExts(cfg?.video_extensions, VIDEO_EXTS_DEFAULT));
@@ -1279,13 +1478,14 @@ async function cleanupEmptyFolders(rootCid) {
   await cleanupEmptyFoldersSlow(rootCid, isMedia);
 }
 
-// Fast path: one downfolders + one downfiles call reveal the entire subtree
-// shape and which folders contain ANY file (downfiles' pid maps to downfolders'
-// fid). We delete only subtrees that contain zero files — one deleteFolder per
-// top-level empty branch (server cascades children with ignore_warn=1).
-// Folders that hold non-media junk are left alone here; that aggressive cleanup
-// requires per-folder listFolder calls and is left to the slow fallback only
-// when the user opts in.
+/**
+ * 快速清理：通过 downfolders + downfiles 两次 API 拿到子树骨架与文件父目录映射，
+ * 在内存里 rollup 每个目录的 subtreeFiles 数量，找出 subtreeFiles=0 的顶级空分支批量删除。
+ *
+ * 设计要点：
+ * - 只删"顶级空分支"，不重复删除其嵌套子目录（115 删除会级联，ignore_warn=1）；
+ * - 含非媒体垃圾（如 .DS_Store）的目录不在这里处理；要彻底清理需走慢速路径。
+ */
 async function cleanupEmptyFoldersFast(rootCid /* , isMedia */) {
   const rootStr = String(rootCid);
   const info = await getFolderInfo(rootStr);
@@ -1297,6 +1497,7 @@ async function cleanupEmptyFoldersFast(rootCid /* , isMedia */) {
     listAllSubFiles(pickcode),
   ]);
 
+  // 构建 cid → 节点
   const nodeById = new Map();
   nodeById.set(rootStr, { name: `根目录#${rootStr}`, parentId: null, children: [], fileCount: 0, subtreeFiles: 0 });
   for (const f of folders) {
@@ -1306,16 +1507,19 @@ async function cleanupEmptyFoldersFast(rootCid /* , isMedia */) {
     const pid = String(f.pid || f.parent_id || rootStr);
     nodeById.set(id, { name, parentId: pid, children: [], fileCount: 0, subtreeFiles: 0 });
   }
+  // 反向把每个节点登记到父节点的 children 数组
   for (const [id, node] of nodeById) {
     if (id === rootStr) continue;
     const parent = nodeById.get(node.parentId);
     if (parent) parent.children.push(id);
   }
+  // 累计每个目录的直接文件数
   for (const f of files) {
     const pid = String(f.pid || f.parent_id || '');
     const node = nodeById.get(pid);
     if (node) node.fileCount++;
   }
+  /** 递归汇总子树文件总数到 subtreeFiles。 */
   function rollup(id) {
     const node = nodeById.get(id);
     if (!node) return 0;
@@ -1326,8 +1530,7 @@ async function cleanupEmptyFoldersFast(rootCid /* , isMedia */) {
   }
   rollup(rootStr);
 
-  // Top-level empty branches only: avoid deleting nested empties separately
-  // since the parent delete cascades.
+  // 收集"顶层空分支"：自己空且父非空，避免重复删嵌套节点
   const emptyBranches = [];
   function visit(id, parentIsEmpty) {
     const node = nodeById.get(id);
@@ -1352,6 +1555,10 @@ async function cleanupEmptyFoldersFast(rootCid /* , isMedia */) {
   }
 }
 
+/**
+ * 慢速清理：递归遍历，叶子目录里若没有任何"媒体文件"（包括非媒体垃圾如 .DS_Store 也视为可清理）
+ * 就把整个目录回收。返回值 hasMedia 用于回溯告诉父节点"我这枝还有媒体文件"。
+ */
 async function cleanupEmptyFoldersSlow(rootCid, isMedia) {
   async function walk(cid, parentCid, name) {
     let items;

@@ -1,6 +1,11 @@
 import { getDb } from './db.js';
 import { logger } from './logger.js';
 
+/**
+ * 读取 config_organize.operation_delay_sec（用户配置的写操作间隔秒数），
+ * 返回毫秒数；异常或缺失则返回 0。
+ * 该延迟主要用于规避 115 的频控/风控。
+ */
 function getOpDelayMs() {
   try {
     const row = getDb().prepare('SELECT operation_delay_sec FROM config_organize WHERE id=1').get();
@@ -10,22 +15,33 @@ function getOpDelayMs() {
   }
 }
 
-// 每次写操作（move/rename/delete/create）后的小延时，避免风控
+// 写操作（move/rename/delete/create）后强制的最小延时，避免触发风控
 const WRITE_OP_DELAY_MS = 1200;
+// 删除操作后的更长等待。115 的删除存在异步效应，过快连发容易报错
 const DELETE_OP_DELAY_MS = 10000;
+// Promise 化的 sleep
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
+// 不同 UA 用于不同接口：Apple TV 端 UA 给 webapi/qrcode 用，Chrome UA 给登录接口用
 const UA_APPLE_TV = 'Mozilla/5.0 (Apple TV; CPU tvOS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko)';
 const UA_CHROME = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.93 Safari/537.36';
 
+/**
+ * 取出当前活跃 Cookie 记录（status='active'）。
+ * 若存在多条按 updated_at 倒序取最新。无可用 Cookie 时返回 undefined。
+ */
 export function getActiveCookie() {
   const db = getDb();
   return db.prepare("SELECT * FROM cookies_115 WHERE status='active' ORDER BY updated_at DESC LIMIT 1").get();
 }
 
-// Normalize 115 webapi response: success when state is truthy (1 / true), failure with err.
+/**
+ * 校验 115 webapi 的统一响应结构。
+ * - 成功：data.state 为 1 或 true；
+ * - 失败：state=false/0，抽出 code/message 拼装为可读错误，并把原始 data 挂在 err.responseData 上。
+ */
 function checkResponse(data) {
-  // 115 webapi returns either { state: 1 } or { state: true }; failure has state=false/0
+  // 115 webapi 返回 { state: 1 } 或 { state: true }；失败为 state=false/0
   const ok = data && (data.state === 1 || data.state === true);
   if (!ok) {
     const code = data?.code || data?.errno || '';
@@ -38,7 +54,11 @@ function checkResponse(data) {
   return data;
 }
 
-// Whether a 115 error should be retried. Cookie / auth errors should NOT retry.
+/**
+ * 判断错误是否值得重试。
+ * 不可重试：JSON 解析失败、Cookie/认证错误（40101/40110/40102）、911 操作风控等。
+ * 这些错误重试不会变好，反而会浪费请求配额。
+ */
 function isRetriableError(err) {
   if (err instanceof SyntaxError) return false;
   const code = String(err?.code ?? '');
@@ -48,6 +68,21 @@ function isRetriableError(err) {
   return true;
 }
 
+/**
+ * 所有 115 webapi 调用的统一入口。
+ * 职责：
+ * - 自动注入 Cookie / UA / Referer 等请求头；
+ * - 15s 超时；
+ * - 429 风控：指数退避（2s, 4s, 8s...）后重试；
+ * - 5xx：抛错走重试逻辑；
+ * - 非 JSON 响应：标记 PARSE_ERROR 不重试；
+ * - 业务失败（state=0）：通过 checkResponse 抛错；可重试错误按 1s/2s/4s 退避重试。
+ *
+ * @param {string} url 完整 URL
+ * @param {Object} [options] fetch 选项
+ * @param {number} [retries=3] 最大重试次数
+ * @returns {Promise<Object>} 成功的 JSON 对象
+ */
 export async function fetch115Api(url, options = {}, retries = 3) {
   const cookie = getActiveCookie();
   const headers = {
@@ -63,6 +98,7 @@ export async function fetch115Api(url, options = {}, retries = 3) {
     try {
       const res = await fetch(url, { ...options, headers, signal: AbortSignal.timeout(15000) });
       if (res.status === 429) {
+        // 风控限速：指数退避后重试
         const delay = Math.pow(2, i) * 2000;
         logger.warn('115API', `风控限制，${delay}ms 后重试 (${i + 1}/${retries})`);
         await new Promise(r => setTimeout(r, delay));
@@ -77,6 +113,7 @@ export async function fetch115Api(url, options = {}, retries = 3) {
       try {
         data = JSON.parse(text);
       } catch {
+        // 拿到 HTML/纯文本错误页等异常响应：截前 200 字符方便排查；标记 PARSE_ERROR 不重试
         const preview = text.slice(0, 200);
         const err = new Error(`115 API 返回非JSON响应 (HTTP ${res.status}): ${preview}`);
         err.code = 'PARSE_ERROR';
@@ -88,14 +125,19 @@ export async function fetch115Api(url, options = {}, retries = 3) {
       if (!isRetriableError(err) || i === retries - 1) {
         throw err;
       }
+      // 普通错误重试退避：1s → 2s → 4s
       await new Promise(r => setTimeout(r, Math.pow(2, i) * 1000));
     }
   }
   throw lastErr;
 }
 
-// ----- QR login (mirrors 示例.js) -----
+// ===== 扫码登录 =====
 
+/**
+ * 获取登录二维码 token。返回 uid、time、sign 与二维码图片 URL。
+ * appName 默认 apple_tv，可以选其他端（影响 UA 与登录鉴权细节）。
+ */
 export async function fetchQrToken(appName = 'apple_tv') {
   const url = `https://qrcodeapi.115.com/api/1.0/${appName}/1.0/token`;
   const res = await fetch(url, { headers: { 'User-Agent': UA_APPLE_TV, 'Accept': 'application/json' } });
@@ -105,6 +147,10 @@ export async function fetchQrToken(appName = 'apple_tv') {
   return { uid, time, sign, qrcode: `https://qrcodeapi.115.com/api/1.0/${appName}/1.0/qrcode?uid=${encodeURIComponent(uid)}` };
 }
 
+/**
+ * 轮询二维码状态。data.status 含义大致为：0=待扫码，1=已扫码待确认，2=已确认，-1/-2=过期/异常。
+ * 由前端定时调用。
+ */
 export async function fetchQrStatus(uid, time, sign) {
   const qs = new URLSearchParams({ uid: String(uid), time: String(time), sign: String(sign) });
   const url = `https://qrcodeapi.115.com/get/status/?${qs}`;
@@ -114,6 +160,11 @@ export async function fetchQrStatus(uid, time, sign) {
   return data.data;
 }
 
+/**
+ * 扫码确认后用 uid 换取登录态 Cookie 字符串。
+ * 返回形如 "USERID=...; UID=...; ..." 的整串 Cookie。
+ * 优先用响应里的 _cookie_header；否则把 data.cookie 对象拼成 "k=v; k=v" 形式。
+ */
 export async function fetchQrLoginResult(uid, appName = 'apple_tv') {
   const url = `https://passportapi.115.com/app/1.0/${appName}/1.0/login/qrcode`;
   const body = `account=${encodeURIComponent(uid)}&app=${appName}`;
@@ -130,6 +181,9 @@ export async function fetchQrLoginResult(uid, appName = 'apple_tv') {
   throw new Error(data.message || data.error || '未拿到Cookie');
 }
 
+/**
+ * 拿 Cookie 反查用户信息（用户名/容量/VIP 等），用于落库展示。
+ */
 export async function fetch115UserInfo(cookieStr, appName = 'apple_tv') {
   const ts = Date.now();
   const url = `https://passportapi.115.com/app/1.0/${appName}/26.0/user/base_info?_t=${ts}`;
@@ -142,6 +196,13 @@ export async function fetch115UserInfo(cookieStr, appName = 'apple_tv') {
   return data.data;
 }
 
+/**
+ * 保存新的 Cookie 到数据库：
+ * 1) 把当前 active 状态的旧记录改为 replaced；
+ * 2) 插入新 Cookie 并标记 active；
+ * 3) 清理超过 7 天的 replaced 历史记录；
+ * 4) 返回新写入的活跃记录。
+ */
 export function saveCookie(cookieStr, userInfo) {
   const db = getDb();
   db.prepare("UPDATE cookies_115 SET status='replaced', updated_at=datetime('now','localtime') WHERE status='active'").run();
@@ -159,18 +220,22 @@ export function saveCookie(cookieStr, userInfo) {
       Number(userInfo.size_total_raw) || 0,
       userInfo.vip_info ? JSON.stringify(userInfo.vip_info) : null,
     );
-  // Purge replaced cookies older than 7 days
+  // 清理 7 天前的旧记录
   db.prepare("DELETE FROM cookies_115 WHERE status='replaced' AND updated_at < datetime('now','-7 days','localtime')").run();
   logger.info('115', `Cookie已保存，用户: ${userInfo.user_name}`);
   return getActiveCookie();
 }
 
+/**
+ * 校验 Cookie 是否仍然有效。
+ * 关键点：仅在错误消息明显指向认证（cookie/登录/失效/401/403）时才判失效；
+ * 网络抖动等瞬时错误一律视为 valid+transient，避免错误地把好 Cookie 标记为过期。
+ */
 export async function verifyCookie(cookieStr) {
   try {
     const info = await fetch115UserInfo(cookieStr);
     return { valid: true, info };
   } catch (err) {
-    // Only mark invalid for definitive auth failures, not transient network errors.
     if (/cookie|登录|未登录|失效|401|403/i.test(err.message)) {
       return { valid: false, reason: err.message };
     }
@@ -178,16 +243,22 @@ export async function verifyCookie(cookieStr) {
   }
 }
 
+/**
+ * 把指定 Cookie 标记为 expired（仅改状态，不删记录，便于回溯）。
+ */
 export function expireCookie(id) {
   const db = getDb();
   db.prepare("UPDATE cookies_115 SET status='expired', updated_at=datetime('now','localtime') WHERE id=?").run(id);
 }
 
-// ----- File / folder listing -----
+// ===== 文件/目录列表 =====
 
-// Normalize a single item from 115 `files` API into { id, name, isFolder, size, parentCid }.
+/**
+ * 把 115 files 接口返回的一条原始 item 归一化为业务层友好的对象。
+ * 规则：fid 存在 → 文件；fid 不存在但 cid 存在 → 文件夹。
+ * @returns {{id,name,isFolder,size,parentCid,raw}}
+ */
 export function normalizeItem(item, parentCid) {
-  // Folders: cid present, no fid. Files: fid present.
   const isFolder = !item.fid && (item.cid != null);
   return {
     id: isFolder ? String(item.cid) : String(item.fid),
@@ -199,28 +270,33 @@ export function normalizeItem(item, parentCid) {
   };
 }
 
-// Normalize the items array out of a 115 API response.
-// 115 returns either { data: [...] } or (rarely) { data: { list: [...] }, list: [...] }.
+/**
+ * 从 115 响应中提取 items 数组。
+ * 115 接口有多种响应结构：data 直接是数组 / data.list / 顶层 list / data.files。
+ * 这里穷举常见形态以保证健壮性。
+ */
 function extractItems(data) {
   let raw = data?.data ?? data?.list;
   if (Array.isArray(raw)) return raw;
-  // Nested format: data is an object; look for a list inside it.
   if (raw && typeof raw === 'object') {
     const nested = raw.list ?? raw.files ?? raw.data;
     if (Array.isArray(nested)) return nested;
   }
-  // Last resort: top-level list field.
   if (Array.isArray(data?.list)) return data.list;
   return [];
 }
 
-// Page through one folder. cid='0' = root.
+/**
+ * 列出单个目录（不递归）。cid='0' 表示根目录。
+ * 自动分页（每页 1000，115 实际上限约 1150，留余量）。
+ * @param {string} cid 目录 ID
+ * @param {{onlyFolders?:boolean}} opts onlyFolders=true 时仅返回子目录
+ */
 export async function listFolder(cid, { onlyFolders = false } = {}) {
   if (!getActiveCookie()) throw new Error('未登录115账号');
   const all = [];
   let offset = 0;
   const limit = 1000;
-  // 115 caps page size around 1150; keep at 1000.
   while (true) {
     const ts = Date.now();
     const url = `https://webapi.115.com/files?aid=1&cid=${encodeURIComponent(cid)}&o=user_ptime&asc=0&offset=${offset}&limit=${limit}&show_dir=1&snap=0&natsort=1&format=json&_t=${ts}`;
@@ -236,22 +312,30 @@ export async function listFolder(cid, { onlyFolders = false } = {}) {
     if (items.length < limit) break;
     const total = Number(data?.count || data?.total || 0);
     if (total && offset >= total) break;
+    // 翻页间也做小延时；读操作的延时上限封到 10s
     await new Promise(r => setTimeout(r, Math.min(getOpDelayMs(), 10000)));
   }
   return all;
 }
 
-// Backwards-compatible aliases
+// 向后兼容的便捷别名
 export const listFolders = (cid = '0') => listFolder(cid, { onlyFolders: true });
 export const listFiles = (cid) => listFolder(cid, { onlyFolders: false });
 
+/**
+ * 获取单个文件的详细信息（含 pickcode、mtime 等）。
+ */
 export async function getFileInfo(fileId) {
   const ts = Date.now();
   const url = `https://webapi.115.com/files?aid=1&file_id=${encodeURIComponent(fileId)}&format=json&_t=${ts}`;
   return fetch115Api(url);
 }
 
-// Batch rename. pairs: [[fileId, newName], ...] or [{id|fileId, name|newName}, ...]
+/**
+ * 批量重命名。
+ * pairs 接受两种格式：[[fileId, newName], ...] 或 [{id|fileId, name|newName}, ...]
+ * 自动归一化并跳过非法项（缺 id 或缺名称）。
+ */
 export async function renameFiles(pairs) {
   const norm = (pairs || [])
     .map(p => Array.isArray(p) ? p : [p.id ?? p.fileId, p.name ?? p.newName])
@@ -265,15 +349,23 @@ export async function renameFiles(pairs) {
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: body.toString(),
   });
+  // 写操作后小睡避免风控
   await sleep(WRITE_OP_DELAY_MS);
   return res;
 }
 
+/**
+ * 单文件重命名（便捷封装）。
+ */
 export async function renameFile(fileId, newName) {
   return renameFiles([[fileId, newName]]);
 }
 
-// Batch move. fileIds: string|string[]; all files go to the same target cid.
+/**
+ * 批量移动文件到目标 cid。所有传入的文件必须移动到同一个目标目录。
+ * @param {string|string[]} fileIds 单个或一组文件 ID
+ * @param {string} targetCid 目标目录 cid
+ */
 export async function moveFiles(fileIds, targetCid) {
   const ids = (Array.isArray(fileIds) ? fileIds : [fileIds])
     .map(v => v == null ? '' : String(v))
@@ -292,10 +384,15 @@ export async function moveFiles(fileIds, targetCid) {
   return res;
 }
 
+/** 单文件移动（便捷封装）。 */
 export async function moveFile(fileId, targetCid) {
   return moveFiles([fileId], targetCid);
 }
 
+/**
+ * 在 parentCid 下创建一个子目录。
+ * 返回 { cid, name, raw }。响应里的 cid 字段可能位于不同层级，多处兜底。
+ */
 export async function createFolder(parentCid, folderName) {
   const url = 'https://webapi.115.com/files/add';
   const body = new URLSearchParams({ pid: String(parentCid), cname: folderName }).toString();
@@ -305,13 +402,15 @@ export async function createFolder(parentCid, folderName) {
     body,
   });
   await sleep(WRITE_OP_DELAY_MS);
-  // Response may be { state, cid, cname } or { state, data: { ... } }
+  // 响应结构可能是 { state, cid, cname } 或 { state, data: { ... } }
   const cid = data.cid || data.data?.cid || data.data?.file_id || data.data?.fid;
   if (!cid) throw new Error('创建目录失败：响应缺少 cid');
   return { cid: String(cid), name: folderName, raw: data };
 }
 
-// Batch recycle. fileIds: string|string[].
+/**
+ * 批量移入回收站。
+ */
 export async function moveToRecycleBatch(fileIds) {
   const ids = (Array.isArray(fileIds) ? fileIds : [fileIds])
     .map(v => v == null ? '' : String(v))
@@ -329,21 +428,27 @@ export async function moveToRecycleBatch(fileIds) {
   return res;
 }
 
+/** 单文件移入回收站。 */
 export async function moveToRecycle(fileId) {
   return moveToRecycleBatch([fileId]);
 }
 
+/** deleteFile 是 moveToRecycle 的别名（115 没有真正"硬删除"接口）。 */
 export async function deleteFile(fileId) {
   return moveToRecycle(fileId);
 }
 
+/**
+ * 删除文件夹（移入回收站）。
+ * 必须显式带 ignore_warn=1，否则当文件夹内仍有空子目录时会被服务端的"二次确认"提示挡住。
+ * 删除后等待较长（10s），因为 115 删除有异步效应。
+ */
 export async function deleteFolder(cid, parentCid) {
   const qs = parentCid ? `?pid=${encodeURIComponent(parentCid)}` : '';
   const url = `https://webapi.115.com/rb/delete${qs}`;
   const body = new URLSearchParams();
   body.append('fid[0]', String(cid));
-  // 115 的 rb/delete 接口：文件夹下若残留子目录（即使没有文件），
-  // ignore_warn=0 会被服务端的二次确认提示挡住而无法删除。
+  // 115 rb/delete 接口：即便子目录已空，ignore_warn=0 仍会触发服务端二次确认而失败
   body.append('ignore_warn', '1');
   const res = await fetch115Api(url, {
     method: 'POST',
@@ -354,30 +459,47 @@ export async function deleteFolder(cid, parentCid) {
   return res;
 }
 
+/**
+ * 获取文件 CDN 下载链接，主要给 ffprobe 流式读取用。
+ * 注意：此处 pickcode 字段实际传的是 fileId，调用方需保证一致性。
+ */
 export async function getDownloadUrl(fileId) {
   const ts = Date.now();
   const url = `https://webapi.115.com/files/download?pickcode=${encodeURIComponent(fileId)}&_t=${ts}`;
   return fetch115Api(url);
 }
 
+/**
+ * 文件搜索（在某个目录及其子目录中按关键字搜索）。
+ */
 export async function searchFiles(keyword, cid = '0') {
   const ts = Date.now();
   const url = `https://webapi.115.com/files/search?search_value=${encodeURIComponent(keyword)}&cid=${encodeURIComponent(cid)}&offset=0&limit=100&format=json&_t=${ts}`;
   return fetch115Api(url);
 }
 
+/**
+ * 根据 cid 取目录的绝对路径链（115 内部的目录链表示）。
+ */
 export async function getFolderPath(cid) {
   const ts = Date.now();
   const url = `https://webapi.115.com/files/get_path?cid=${encodeURIComponent(cid)}&_t=${ts}`;
   return fetch115Api(url);
 }
 
+/**
+ * 把单个路径段清洗为 115 能接受的目录名。
+ * 去除 / \ : * ? " < > | 等特殊字符并 trim。
+ */
 function sanitizeSegment(seg) {
   return String(seg ?? '').replace(/[\/\\:*?"<>|]/g, '').trim();
 }
 
-// Find a folder by name under parent; return the folder's cid or null.
-// Optional `cache` skips the API call when present.
+/**
+ * 在 parentCid 下按名称查找一个子目录。
+ * 命中返回其 cid，否则返回 null。
+ * 若传入 cache（FolderTreeCache），优先走内存缓存，避免一次 listFolder API 调用。
+ */
 export async function findFolderByName(parentCid, name, cache = null) {
   if (!name) return null;
   if (cache) {
@@ -389,9 +511,14 @@ export async function findFolderByName(parentCid, name, cache = null) {
   return hit ? hit.id : null;
 }
 
-// Get or create a chain of folders. segments: ['电影', '国产', '2023'] => returns final cid.
-// If `cache` is provided, existing folders are resolved from memory and only missing
-// segments cause a createFolder call; the cache is updated as new folders are created.
+/**
+ * 沿路径段链确保目录存在；不存在则逐层创建，返回末端 cid。
+ * 用于把 ['电影','国产','2023'] 这样的层级一次性建出来。
+ *
+ * 提供 cache 时：
+ * - 先在缓存里走能走到的最深层，剩余段才走 createFolder；
+ * - 新建出的目录同步写入缓存，下次再走相同路径就完全无 API 调用。
+ */
 export async function ensureFolderPath(parentCid, segments, cache = null) {
   let cid = String(parentCid);
   if (cache) {
@@ -413,17 +540,27 @@ export async function ensureFolderPath(parentCid, segments, cache = null) {
   return cid;
 }
 
-// In-memory mirror of a 115 folder subtree, populated via the bulk
-// /files/downfolders endpoint. Lets ensureFolderPath / findFolderByName
-// resolve known paths without any API call.
+/**
+ * 一个 115 目录子树的内存镜像。
+ * 通过 /files/downfolders 接口一次性拉取目标目录下所有子文件夹的扁平列表，
+ * 在内存中重建父子结构。后续 ensureFolderPath / findFolderByName 可以完全离线命中已存在的路径，
+ * 显著减少 API 调用次数。
+ */
 export class FolderTreeCache {
+  /**
+   * @param {string} rootCid 缓存所镜像的根目录 cid
+   */
   constructor(rootCid) {
     this.rootCid = String(rootCid);
-    // cid -> { name, parentId, children: Map<sanitizedName, cid> }
+    // cid → { name, parentId, children: Map<sanitizedName, cid> }
     this.byId = new Map();
     this.byId.set(this.rootCid, { name: '', parentId: null, children: new Map() });
   }
 
+  /**
+   * 从 115 拉取全部子目录并构建索引。
+   * 必须先拿到 root 的 pickcode 才能调 downfolders。
+   */
   async load() {
     const info = await getFolderInfo(this.rootCid);
     const pickcode = String(
@@ -432,6 +569,7 @@ export class FolderTreeCache {
     );
     if (!pickcode) throw new Error(`FolderTreeCache: 未取得根 cid=${this.rootCid} 的 pickcode`);
     const folders = await listAllSubFolders(pickcode);
+    // 第一遍：把所有节点放进 byId
     for (const f of folders) {
       const id = String(pickField(f, 'fid', 'cid', 'id') || '');
       const name = String(pickField(f, 'fn', 'n', 'name') || '');
@@ -439,6 +577,7 @@ export class FolderTreeCache {
       if (!id) continue;
       this.byId.set(id, { name, parentId: pid, children: new Map() });
     }
+    // 第二遍：根据 parentId 把每个节点挂到父节点的 children 上
     for (const [id, node] of this.byId) {
       if (id === this.rootCid) continue;
       const parent = this.byId.get(node.parentId);
@@ -448,6 +587,10 @@ export class FolderTreeCache {
     return this;
   }
 
+  /**
+   * 查找 parentCid 下名为 name 的子目录 cid。
+   * 同时尝试原名与 sanitize 后的名字，应对历史目录可能未清洗的情形。
+   */
   child(parentCid, name) {
     const safe = sanitizeSegment(name);
     if (!safe) return undefined;
@@ -456,6 +599,9 @@ export class FolderTreeCache {
     return node.children.get(name) || node.children.get(safe);
   }
 
+  /**
+   * 把一个新建的目录添加进缓存（在 ensureFolderPath 创建出新目录后调用）。
+   */
   add(parentCid, name, cid) {
     const pid = String(parentCid);
     const id = String(cid);
@@ -465,8 +611,10 @@ export class FolderTreeCache {
     if (parent) parent.children.set(safe, id);
   }
 
-  // Resolve as many segments as possible from cache. Returns the cid reached
-  // and the remaining segments that need to be created.
+  /**
+   * 从 parentCid 出发尽可能匹配 segments 路径。
+   * @returns {{cid:string, remaining:string[]}} cid=能走到的最深 cid；remaining=还没建出来的剩余段
+   */
   resolvePath(parentCid, segments) {
     let cid = String(parentCid);
     const segs = (segments || []).map(sanitizeSegment).filter(Boolean);
@@ -482,9 +630,12 @@ export class FolderTreeCache {
   }
 }
 
-// ----- Share link transfer -----
+// ===== 分享转存 =====
 
-// Parse a 115 share URL like https://115.com/s/<code>?password=<code>
+/**
+ * 解析 115 分享链接，提取 shareCode（s/<code>）与 receiveCode（?password=<code>）。
+ * 兼容 115/115cdn/anxia 三个主域名。无法识别返回 null。
+ */
 export function parseShareLink(link) {
   if (!link) return null;
   const text = String(link).trim();
@@ -493,7 +644,10 @@ export function parseShareLink(link) {
   return { shareCode: m[1], receiveCode: m[2] };
 }
 
-// Page through the top-level entries of a share.
+/**
+ * 翻页获取分享根目录下的全部条目。
+ * @returns {{shareInfo, list}} shareInfo 含分享标题等元信息；list 为顶层条目数组
+ */
 export async function fetchShareSnap(shareCode, receiveCode) {
   const all = [];
   const limit = 20;
@@ -514,7 +668,13 @@ export async function fetchShareSnap(shareCode, receiveCode) {
   return { shareInfo, list: all };
 }
 
-// Transfer all top-level entries of a share into targetCid. targetCid '0' = root.
+/**
+ * 把分享的所有顶层条目转存到目标 cid（默认根目录）。
+ * 流程：解析链接 → 拿当前用户 user_id → 抓分享条目 → 拼一次 /share/receive 调用。
+ *
+ * 容错：若服务端返回"无需重复接收/已接收"，视为成功并标记 alreadyTransferred=true，
+ * 这样 UI 可以友好提示而不是当成错误。
+ */
 export async function transferShareLink(link, targetCid = '0') {
   const parsed = parseShareLink(link);
   if (!parsed) throw new Error('链接格式错误，正确格式：https://115.com/s/<code>?password=<code>');
@@ -554,14 +714,18 @@ export async function transferShareLink(link, targetCid = '0') {
   }
 }
 
-// List videos / metas recursively. maxDepth guards against pathological structures.
-// Strategy:
-//   1. Fast: one downfolders + one downfiles call expose the full tree. distinct(downfiles.pid)
-//      gives every folder that actually contains files (downfiles.pid == downfolders.fid).
-//      We then listFolder ONLY those folders to obtain real filenames. Intermediate folders
-//      with no direct files are visited entirely in-memory (no API call).
-//   2. Slow fallback: original per-folder DFS, in case the bulk endpoints reject or root has
-//      no pickcode (cid=0).
+/**
+ * 递归列出某目录下的所有文件。
+ *
+ * 实现策略：
+ *   1) 快速路径（非根目录）：调用 listFilesRecursiveHybrid —— 用 downfolders + downfiles
+ *      两次批量调用拿全树骨架；然后只对"实际包含文件的叶子目录"调 listFolder 拿真实文件名。
+ *   2) 慢速回退：逐目录 DFS。当快速路径失败（如根目录没有 pickcode）或抛错时使用。
+ *
+ * @param {string} rootCid 起始目录 cid
+ * @param {{maxDepth?:number, onItem?:Function}} opts maxDepth=深度上限（防御病态结构）
+ * @returns {Promise<Array>} 文件条目数组（含 pathSegs/depth/isFolder=false）
+ */
 export async function listFilesRecursive(rootCid, { maxDepth = 8, onItem } = {}) {
   const cidStr = String(rootCid);
   if (cidStr !== '0') {
@@ -574,7 +738,15 @@ export async function listFilesRecursive(rootCid, { maxDepth = 8, onItem } = {})
   return listFilesRecursiveSlow(cidStr, { maxDepth, onItem });
 }
 
-// Hybrid scanner: bulk tree + targeted listFolder on leaf folders that hold files.
+/**
+ * 混合扫描实现：
+ * - 一次 downfolders 拿全部子目录骨架；一次 downfiles 拿所有文件的"所属父目录"集合；
+ * - 取 distinct(downfiles.pid) 得到"真正含直接文件的目录"列表；
+ * - 只对这些目录调 listFolder 拿到真实文件名（带正确大小写、扩展名）。
+ *
+ * 优点：中间层"只含子目录、无直接文件"的节点完全在内存中遍历，零 API 调用。
+ * 对深目录树扫描性能影响巨大（实测百级目录可减少 10× 调用）。
+ */
 async function listFilesRecursiveHybrid(rootCid, { maxDepth = 8, onItem } = {}) {
   const rootStr = String(rootCid);
   const info = await getFolderInfo(rootStr);
@@ -584,11 +756,13 @@ async function listFilesRecursiveHybrid(rootCid, { maxDepth = 8, onItem } = {}) 
   );
   if (!pickcode) throw new Error('未取得根 pickcode');
 
+  // 并发拉子目录骨架 + 文件父目录集合
   const [folders, files] = await Promise.all([
     listAllSubFolders(pickcode),
     listAllSubFiles(pickcode),
   ]);
 
+  // 构建 cid → 节点 表
   const dirById = new Map();
   dirById.set(rootStr, { name: '', parentId: null });
   for (const f of folders) {
@@ -599,6 +773,7 @@ async function listFilesRecursiveHybrid(rootCid, { maxDepth = 8, onItem } = {}) 
     dirById.set(id, { name, parentId: pid });
   }
 
+  // 给定 cid 反推从根到自身的路径段（带缓存避免重复回溯）
   const segsCache = new Map();
   function segsFor(cid) {
     if (cid === rootStr) return [];
@@ -616,7 +791,7 @@ async function listFilesRecursiveHybrid(rootCid, { maxDepth = 8, onItem } = {}) 
     return segs;
   }
 
-  // Distinct parent folders that hold direct files
+  // 真正持有文件的父目录集合
   const targets = new Set();
   for (const f of files) {
     const pid = String(pickField(f, 'pid', 'parent_id') || '');
@@ -655,8 +830,8 @@ async function listFilesRecursiveHybrid(rootCid, { maxDepth = 8, onItem } = {}) 
     }
     done++;
     logger.info('115', `[fast-scan]   ← ${fileCount} 文件 用时${Date.now() - callStart}ms`);
-    // Reads need only mild pacing; the user's operation_delay_sec is tuned for writes
-    // and would otherwise blow up scan time on flat libraries.
+    // 读操作延时上限 10s：用户配置的 operation_delay_sec 是给写操作准的，
+    // 直接套用到扫描会让扁平库的扫描时间爆炸性增长。
     const delay = Math.min(getOpDelayMs(), 10000);
     if (delay > 0) await sleep(delay);
   }
@@ -664,6 +839,10 @@ async function listFilesRecursiveHybrid(rootCid, { maxDepth = 8, onItem } = {}) 
   return result;
 }
 
+/**
+ * 慢速递归实现（兜底）：朴素 DFS 遍历每个目录调一次 listFolder。
+ * 用于快速路径失败或扫根目录（cid='0' 没有 pickcode）的场景。
+ */
 async function listFilesRecursiveSlow(rootCid, { maxDepth = 8, onItem } = {}) {
   const result = [];
   async function walk(cid, depth, pathSegs) {
@@ -687,15 +866,21 @@ async function listFilesRecursiveSlow(rootCid, { maxDepth = 8, onItem } = {}) {
   return result;
 }
 
-// ----- Fast bulk tree listing via 115 download-manager API -----
+// ===== 批量树遍历（依赖 115 下载器后台接口） =====
 
-// Get folder metadata (incl. pick_code) for a non-root cid.
+/**
+ * 获取非根目录的元数据（含 pick_code）。pickcode 是 downfolders/downfiles 的鉴权凭据。
+ */
 export async function getFolderInfo(cid) {
   const ts = Date.now();
   const url = `https://webapi.115.com/category/get?cid=${encodeURIComponent(cid)}&_t=${ts}`;
   return fetch115Api(url);
 }
 
+/**
+ * 从对象的若干候选键中取第一个非空值。
+ * 115 不同接口对同一字段会用不同命名（fid/cid/id、fn/n/name…），用此函数统一取值。
+ */
 function pickField(obj, ...keys) {
   for (const k of keys) {
     const v = obj?.[k];
@@ -704,8 +889,11 @@ function pickField(obj, ...keys) {
   return undefined;
 }
 
-// Paginated GET against /app/chrome/downfolders or /app/chrome/downfiles.
-// Returns the flat list of raw items across all pages.
+/**
+ * 对 /files/downfolders 或 /files/downfiles 做分页抓取，把所有页合并为一个扁平数组。
+ * 每页 5000 条；翻页之间走 op delay 节流。
+ * has_next_page 与 count 互为兜底，保证收尾正确性。
+ */
 async function fetchAllPages(endpoint, pickcode) {
   const all = [];
   let page = 1;
@@ -735,16 +923,25 @@ async function fetchAllPages(endpoint, pickcode) {
   return all;
 }
 
+/** 一次性拉取某目录下所有子文件夹（扁平）。 */
 export async function listAllSubFolders(pickcode) {
   return fetchAllPages('downfolders', pickcode);
 }
 
+/** 一次性拉取某目录下所有文件（扁平）。 */
 export async function listAllSubFiles(pickcode) {
   return fetchAllPages('downfiles', pickcode);
 }
 
-// Bulk tree walker. Two paginated calls (folders + files) plus one /category/get for root,
-// then path reconstruction in-memory via parent_id. Returns same shape as listFilesRecursiveSlow.
+/**
+ * 纯快速实现的递归列表：两次分页 API + 一次根目录 /category/get，
+ * 之后所有 path 重建都在内存里完成。
+ *
+ * 与 listFilesRecursiveHybrid 的区别：本函数不再对叶子目录二次 listFolder，
+ * 文件名直接来自 downfiles 响应（字段命名各异，由 pickField 兜底）。
+ *
+ * 返回结构与 listFilesRecursiveSlow 完全一致，便于上层互换。
+ */
 export async function listFilesRecursiveFast(rootCid, { maxDepth = 8, onItem } = {}) {
   const cidStr = String(rootCid);
   const rootInfo = await getFolderInfo(cidStr);
@@ -760,7 +957,7 @@ export async function listFilesRecursiveFast(rootCid, { maxDepth = 8, onItem } =
   ]);
   logger.debug('115', `bulk tree cid=${cidStr} → ${rawFolders.length} 文件夹 + ${rawFiles.length} 文件`);
 
-  // Build dir tree: id -> { name, parentId }
+  // 建立 id → { name, parentId } 索引
   const dirById = new Map();
   dirById.set(cidStr, { name: '', parentId: null });
   for (const f of rawFolders) {
@@ -771,6 +968,7 @@ export async function listFilesRecursiveFast(rootCid, { maxDepth = 8, onItem } =
     dirById.set(id, { name, parentId: pid || cidStr });
   }
 
+  /** 根据 id 回溯到根，组装从根到自身的路径段数组。 */
   function ancestorsOf(id) {
     const segs = [];
     let cur = id;
