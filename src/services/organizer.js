@@ -286,10 +286,15 @@ async function identifyGroup(group, cfg) {
   // Merge: pick title/year from the most-informative entry, but keep per-file S/E.
   const merged = pickBestParsed(parsedAll, group);
 
-  // Structural hint for media type
+  // Structural hint for media type.
+  // Only let the heuristic flip to TV when we DON'T already have a tmdbId/mediaType from
+  // parsing — a folder named "Movie (Year) {tmdb-XXX}" with a featurette next to the main
+  // file otherwise gets mis-classified as TV just because videoFiles.length > 1.
   const videoExts = new Set(parseExts(cfg.video_extensions, VIDEO_EXTS_DEFAULT));
   const struct = detectMediaTypeFromStructure(group.videos.map(v => v.name), group.folderName, videoExts);
-  if (struct === 'tv') merged.mediaType = 'tv';
+  if (struct === 'tv' && !merged.tmdbId) {
+    merged.mediaType = 'tv';
+  }
 
   // 4.6.2: TMDB search if we lack tmdbId
   if (!merged.tmdbId && merged.title) {
