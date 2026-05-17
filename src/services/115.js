@@ -1,6 +1,15 @@
 import { getDb } from './db.js';
 import { logger } from './logger.js';
 
+function getOpDelayMs() {
+  try {
+    const row = getDb().prepare('SELECT operation_delay_sec FROM config_organize WHERE id=1').get();
+    return Math.max(0, Number(row?.operation_delay_sec) || 0) * 1000;
+  } catch {
+    return 0;
+  }
+}
+
 const UA_APPLE_TV = 'Mozilla/5.0 (Apple TV; CPU tvOS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko)';
 const UA_CHROME = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.93 Safari/537.36';
 
@@ -222,6 +231,7 @@ export async function listFolder(cid, { onlyFolders = false } = {}) {
     if (items.length < limit) break;
     const total = Number(data?.count || data?.total || 0);
     if (total && offset >= total) break;
+    await new Promise(r => setTimeout(r, getOpDelayMs()));
   }
   return all;
 }
@@ -431,6 +441,7 @@ export async function listFilesRecursive(rootCid, { maxDepth = 8, onItem } = {})
     logger.debug('115', `listFolder(${cid}) depth=${depth} → ${folders.length} 文件夹, ${files.length} 文件`);
     for (const it of items) {
       if (it.isFolder) {
+        await new Promise(r => setTimeout(r, getOpDelayMs()));
         await walk(it.id, depth + 1, [...pathSegs, it.name]);
       } else {
         const entry = { ...it, depth, pathSegs: [...pathSegs] };
