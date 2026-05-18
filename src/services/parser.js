@@ -41,9 +41,14 @@ function canonicalize(match, list) {
   return list.find(item => norm(item) === k) || match;
 }
 
+// 扩展名走白名单：`\.(mp4|mkv|...)$`，避免把 .BTEE / .FRDS 这种字母数字结尾的压制组误剥成扩展名。
+const EXT_RE = RULES.extensions?.length
+  ? new RegExp(`\\.(?:${RULES.extensions.map(escapeRe).join('|')})$`, 'i')
+  : compile(RULES.extensionPattern);
+
 // 预编译：模块加载时一次性把 JSON 里的字符串吃成 RegExp 对象，避免热路径重复 new RegExp。
 const RX = {
-  ext:        compile(RULES.extensionPattern),
+  ext:        EXT_RE,
   tmdb:       compile(RULES.tmdbIdPattern),
   hdr:        compile(RULES.hdrPattern),
   bitDepth:   compile(RULES.bitDepthPattern),
@@ -340,10 +345,15 @@ export function parseFilename(filename) {
     result.title = result.title.replace(RX.titleModifiers, '').replace(/\s+/g, ' ').trim();
   }
 
-  // 中文 + 尾部 ASCII 段：剥掉 ASCII 段（多是英文别名）
+  // 中文 + 尾部 ASCII 段：从最后一个 CJK 字符之后整段砍掉（多是英文别名 / 语言标记）。
+  // 比起"匹配 ASCII 字符类到末尾"，这个写法不会被 & / 等非常规符号卡停。
   if (/[一-鿿]/.test(result.title)) {
-    const cjkOnly = result.title.replace(/\s+[A-Za-z][\w\s,'.:!?-]*$/, '').trim();
-    if (cjkOnly) result.title = cjkOnly;
+    let lastCjk = -1;
+    for (let i = result.title.length - 1; i >= 0; i--) {
+      const code = result.title.charCodeAt(i);
+      if (code >= 0x4E00 && code <= 0x9FFF) { lastCjk = i; break; }
+    }
+    if (lastCjk >= 0) result.title = result.title.slice(0, lastCjk + 1).trim();
   }
 
   if (!result.mediaType) result.mediaType = 'movie';

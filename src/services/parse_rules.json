@@ -4,12 +4,21 @@
   "resolutions": ["2160p", "1080p", "720p", "480p", "4K", "2K", "8K"],
 
   "sources": [
-    "BluRay", "BLURAY", "Blu-ray", "UHD",
-    "WEB-DL", "WEBDL", "WEBRip",
+    "BluRay", "BLURAY", "Blu-ray", "BD", "UHD",
+    "WEB-DL", "WEBDL", "WEBRip", "WEB",
     "HDTV", "DVD",
     "Remux", "REMUX",
     "Encode", "BDRip", "BRRip", "HDRip",
     "TC", "TS", "CAM"
+  ],
+
+  "_extensionsNote": "扩展名白名单。比起 \\.[a-z0-9]+$ 更安全：避免把 .BTEE / .FRDS 这种压制组缩写当成扩展名剥掉。",
+  "extensions": [
+    "mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "m4v",
+    "ts", "mts", "m2ts", "rmvb", "rm", "3gp",
+    "mpg", "mpeg", "vob", "ogv", "asf", "divx", "f4v", "iso",
+    "srt", "ass", "ssa", "sub", "idx", "smi", "vtt",
+    "nfo", "jpg", "jpeg", "png"
   ],
 
   "videoCodecs": [
@@ -54,7 +63,6 @@
     { "re": "\\b(?:HQ|LQ|HighQuality|LowQuality)\\b", "flags": "g" }
   ],
 
-  "extensionPattern":   { "re": "\\.([a-z0-9]+)$",                                          "flags": "i" },
   "tmdbIdPattern":      { "re": "[\\[\\{(]\\s*tmdb(?:id)?[-_\\s]*?(\\d{2,8})\\s*[\\]\\})]", "flags": "i" },
   "hdrPattern":         { "re": "\\b(HDR|HDR10|HDR10\\+|HLG|Dolby\\s*Vision|DoVi)\\b",       "flags": "i" },
   "bitDepthPattern":    { "re": "\\b(\\d{1,2})\\s*bit\\b",                                   "flags": "i" },
