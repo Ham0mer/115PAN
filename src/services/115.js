@@ -16,7 +16,7 @@ function getOpDelayMs() {
 }
 
 // 写操作（move/rename/delete/create）后强制的最小延时，避免触发风控
-const WRITE_OP_DELAY_MS = 1200;
+const WRITE_OP_DELAY_MS = 10000;
 // 删除操作后的更长等待。115 的删除存在异步效应，过快连发容易报错
 const DELETE_OP_DELAY_MS = 10000;
 // Promise 化的 sleep
@@ -312,8 +312,8 @@ export async function listFolder(cid, { onlyFolders = false } = {}) {
     if (items.length < limit) break;
     const total = Number(data?.count || data?.total || 0);
     if (total && offset >= total) break;
-    // 翻页间也做小延时；读操作的延时上限封到 10s
-    await new Promise(r => setTimeout(r, Math.min(getOpDelayMs(), 10000)));
+    // 翻页间按用户配置的 operation_delay_sec 节流
+    await sleep(getOpDelayMs());
   }
   return all;
 }
@@ -885,9 +885,8 @@ async function listFilesRecursiveHybrid(rootCid, { maxDepth = 8, onItem } = {}) 
     }
     done++;
     logger.info('115', `[fast-scan]   ← ${fileCount} 文件 用时${Date.now() - callStart}ms`);
-    // 读操作延时上限 10s：用户配置的 operation_delay_sec 是给写操作准的，
-    // 直接套用到扫描会让扁平库的扫描时间爆炸性增长。
-    const delay = Math.min(getOpDelayMs(), 10000);
+    // 每个待扫目录后按用户配置的 operation_delay_sec 节流
+    const delay = getOpDelayMs();
     if (delay > 0) await sleep(delay);
   }
   logger.info('115', `[fast-scan] 完成 ${done}/${targetsArr.length} 用时 ${Date.now() - t0}ms，文件 ${result.length}`);
@@ -908,7 +907,7 @@ async function listFilesRecursiveSlow(rootCid, { maxDepth = 8, onItem } = {}) {
     logger.debug('115', `listFolder(${cid}) depth=${depth} → ${folders.length} 文件夹, ${files.length} 文件`);
     for (const it of items) {
       if (it.isFolder) {
-        await new Promise(r => setTimeout(r, Math.min(getOpDelayMs(), 10000)));
+        await sleep(getOpDelayMs());
         await walk(it.id, depth + 1, [...pathSegs, it.name]);
       } else {
         const entry = { ...it, depth, pathSegs: [...pathSegs] };

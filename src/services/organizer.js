@@ -184,7 +184,7 @@ export async function runOrganize(taskId, options = {}) {
         // 失败通知错误本身不应阻塞后续组，吞掉
         await notifyFailure(`处理失败: ${groupLabel(group)}`, err.message).catch(() => {});
       }
-      const delaySec = Number(cfg.operation_delay_sec) || 1.5;
+      const delaySec = Number(cfg.operation_delay_sec) || 5;
       await sleep(delaySec * 1000);
     }
 
@@ -1288,7 +1288,7 @@ export async function rerunInPlace(originalTaskId) {
           if (cfg.rename_enabled) await renameFile(item.file_id, newName);
         }
         stats.success++;
-        const delaySec = Number(cfg.operation_delay_sec) || 1.5;
+        const delaySec = Number(cfg.operation_delay_sec) || 5;
         await sleep(delaySec * 1000);
       } catch (err) {
         logger.warn('Organizer', `重跑失败: ${item.original_name}`, err.message);
