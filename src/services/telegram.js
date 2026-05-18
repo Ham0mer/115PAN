@@ -79,7 +79,7 @@ export async function sendTestMessage(botId) {
 function fmtSpec(item) {
   const parts = [];
   if (item.resolution) parts.push(item.resolution);
-  if (item.source) parts.push(item.source);
+  if (item.source) parts.push(Array.isArray(item.source) ? item.source.join(' ') : item.source);
   if (item.videoCodec) parts.push(item.videoCodec);
   return parts.length ? parts.join(' ') : '';
 }

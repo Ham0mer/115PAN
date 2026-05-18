@@ -4,7 +4,7 @@ import {
   listFolder, renameFile, renameFiles, moveFile, moveFiles,
   createFolder, findFolderByName, moveToRecycle, moveToRecycleBatch,
 } from '../115.js';
-import { detectLanguage } from '../parser.js';
+import { detectLanguage, joinList } from '../parser.js';
 import { buildSubtitleSuffix, buildMultiVersionSuffix, sanitizeName } from '../template.js';
 import { extOf } from './util.js';
 import { resolveMultiVersion } from './version.js';
@@ -146,10 +146,10 @@ export async function placeVideo({ video, mediaInfo, id, targetCid, showCid, bas
         placedName,
         video.size,
         mediaInfo.resolution || null,
-        mediaInfo.source || null,
+        joinList(mediaInfo.source) || null,
         mediaInfo.videoCodec || null,
-        mediaInfo.audioCodec || null,
-        /truehd|atmos|dolby/i.test(mediaInfo.audioCodec || '') ? 1 : 0,
+        joinList(mediaInfo.audioCodec) || null,
+        /truehd|atmos|dolby/i.test(joinList(mediaInfo.audioCodec)) ? 1 : 0,
       );
   } catch (err) {
     logger.debug('Organizer', `media_library 写入失败: ${err.message}`);

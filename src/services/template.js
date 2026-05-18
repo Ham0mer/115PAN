@@ -1,5 +1,6 @@
 import { getDb } from './db.js';
 import { logger } from './logger.js';
+import { joinList } from './parser.js';
 
 /**
  * 将变量值按格式说明符（fmt）格式化为字符串。
@@ -181,12 +182,12 @@ function buildMovieVars(tmdb, media) {
     tmdbId: tmdb.tmdbId || '',
     imdbId: tmdb.imdbId || '',
     resolution: media.resolution || '',
-    source: media.source || '',
+    source: joinList(media.source),
     videoCodec: media.videoCodec || '',
     bitDepth: media.bitDepth || '',
     hdr: media.hdr || '',
     audioCount: media.audioCount || '',
-    audioCodec: media.audioCodec || '',
+    audioCodec: joinList(media.audioCodec),
     releaseGroup: media.releaseGroup || '',
   };
 }
@@ -219,12 +220,12 @@ function buildTVVars(tmdb, media, season, episode, episodeEnd) {
     seasonTitle: tmdb.seasonTitle || '',
     airDate: tmdb.airDate || '',
     resolution: media.resolution || '',
-    source: media.source || '',
+    source: joinList(media.source),
     videoCodec: media.videoCodec || '',
     bitDepth: media.bitDepth || '',
     hdr: media.hdr || '',
     audioCount: media.audioCount || '',
-    audioCodec: media.audioCodec || '',
+    audioCodec: joinList(media.audioCodec),
     releaseGroup: media.releaseGroup || '',
   };
 }

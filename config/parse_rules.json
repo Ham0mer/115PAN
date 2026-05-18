@@ -1,0 +1,98 @@
+{
+  "_comment": "媒体文件名解析规则。修改这里增删关键字/正则即可，无需改 parser.js。所有正则按 JS RegExp 语法书写；re 字段中的反斜杠需双写。",
+
+  "resolutions": ["2160p", "1080p", "720p", "480p", "4K", "2K", "8K"],
+
+  "sources": [
+    "BluRay", "BLURAY", "Blu-ray", "UHD",
+    "WEB-DL", "WEBDL", "WEBRip",
+    "HDTV", "DVD",
+    "Remux", "REMUX",
+    "Encode", "BDRip", "BRRip", "HDRip",
+    "TC", "TS", "CAM"
+  ],
+
+  "videoCodecs": [
+    "H.264", "H264", "H.265", "H265", "H.266", "H266",
+    "AV1", "AVC", "HEVC",
+    "X264", "x264", "X265", "x265",
+    "VP9", "MPEG-4", "MPEG2"
+  ],
+
+  "audioCodecs": [
+    "DDP5.1", "DDP7.1", "DDP",
+    "TrueHD7.1", "TrueHD", "Atmos",
+    "DTS-HDMA", "DTS-HD", "DTS:X", "DTS",
+    "AAC", "AC3", "EAC3", "FLAC", "PCM", "MP3", "WMA", "OPUS"
+  ],
+
+  "chineseReleaseTags": [
+    "无台标", "有台标",
+    "国粤双语", "国英双语", "中日双语", "中英双语", "粤英双语",
+    "中文字幕", "中英字幕", "简中字幕", "繁中字幕",
+    "国语配音", "粤语配音", "英语配音", "日语配音", "韩语配音",
+    "国语音轨", "粤语音轨",
+    "高码版", "低码版", "加长版", "导演剪辑版", "剧场版", "修复版", "重制版",
+    "无删减", "未删减", "无水印", "去水印",
+    "完整版", "先行版", "预售版"
+  ],
+
+  "streamingPlatforms": [
+    "Disney\\+", "Paramount\\+",
+    "DSNP", "Netflix", "NF", "AMZN", "Amazon",
+    "ATVP", "iTunes", "HMAX", "HBOMax", "HBO", "Hulu", "Peacock", "PCOK", "PMTP",
+    "iQIYI", "iQiyi", "YOUKU", "Youku", "MGTV", "MangoTV",
+    "Bilibili", "Tencent", "WeTV", "Viki",
+    "Crunchyroll", "Funimation", "FUNI"
+  ],
+
+  "noisePatterns": [
+    { "re": "【[^】]*】", "flags": "g" },
+    { "re": "\\bwww\\.[a-z0-9.-]+\\.[a-z]{2,}(?:/[^\\s]*)?", "flags": "gi" },
+    { "re": "\\[[^\\]]*[一-鿿][^\\]]*\\]", "flags": "g" },
+    { "re": "\\b\\d{2,3}\\s*fps\\b", "flags": "gi" },
+    { "re": "\\b(?:HQ|LQ|HighQuality|LowQuality)\\b", "flags": "g" }
+  ],
+
+  "extensionPattern":   { "re": "\\.([a-z0-9]+)$",                                          "flags": "i" },
+  "tmdbIdPattern":      { "re": "[\\[\\{(]\\s*tmdb(?:id)?[-_\\s]*?(\\d{2,8})\\s*[\\]\\})]", "flags": "i" },
+  "hdrPattern":         { "re": "\\b(HDR|HDR10|HDR10\\+|HLG|Dolby\\s*Vision|DoVi)\\b",       "flags": "i" },
+  "bitDepthPattern":    { "re": "\\b(\\d{1,2})\\s*bit\\b",                                   "flags": "i" },
+  "yearPattern":        { "re": "\\b((?:19|20)\\d{2})(?:年(?=[\\s.]|$)|\\b)",                 "flags": "" },
+
+  "audioCountPattern":   { "re": "(\\d+)\\s*Audios?\\s*([A-Za-z][A-Za-z0-9.+:]*?)(?=[\\s.\\-]|$)", "flags": "i" },
+  "audioChannelPattern": { "re": "\\b(DDP|TrueHD|Atmos|DTS-HD[\\s.]*MA|DTS-HD|DTS(?::?X)?|AAC|AC3|EAC3|FLAC|PCM|MP3|WMA|OPUS)[\\s.]*(\\d+\\.\\d+|\\d+)\\b", "flags": "i" },
+
+  "_seasonEpisodeNote": "si/ei/eei = season / episode / episodeEnd 捕获组索引（null 跳过）；fallback=true 在多季合集容器里不参与匹配。",
+  "seasonEpisodePatterns": [
+    { "re": "[Ss](\\d{1,3})\\s*[Ee](\\d{1,3})(?:[-~Ee]+(\\d{1,3}))?",                              "si": 1, "ei": 2, "eei": 3 },
+    { "re": "[Ss](\\d{1,3})\\.?[Ee](\\d{1,3})(?:[-~Ee]+(\\d{1,3}))?",                              "si": 1, "ei": 2, "eei": 3 },
+    { "re": "\\b(\\d{1,2})\\s*[xX]\\s*(\\d{1,3})\\b",                                              "si": 1, "ei": 2 },
+    { "re": "第(\\d{1,3})[季]?\\s*第(\\d{1,3})[集話话](?:[-~至]第?(\\d{1,3})[集話话])?",            "si": 1, "ei": 2, "eei": 3 },
+    { "re": "[Ss]eason\\s*(\\d{1,3})[\\s.]*[Ee]p?(?:isode)?\\s*(\\d{1,3})(?:[-~](\\d{1,3}))?",     "flags": "i", "si": 1, "ei": 2, "eei": 3 },
+    { "re": "[Ee][Pp]?\\s*(\\d{1,3})(?:[-~](\\d{1,3}))?",                                          "ei": 1, "eei": 2, "fallback": true },
+    { "re": "^(\\d{1,3})[\\.\\-\\s]+(?=\\D)",                                                       "ei": 1, "fallback": true }
+  ],
+
+  "seasonRangeContainerPatterns": [
+    { "re": "[Ss]\\d{1,2}\\s*[-~—–]\\s*[Ss]?\\d{1,2}\\b" },
+    { "re": "(?:第\\s*)?\\d{1,2}\\s*[-~—–]\\s*\\d{1,2}\\s*季" }
+  ],
+
+  "chineseSeasonPattern":            { "re": "第\\s*([零一二三四五六七八九十\\d]{1,4})\\s*季" },
+  "chineseEpisodePattern":           { "re": "第\\s*([零一二三四五六七八九十\\d]{1,4})\\s*[集話话回]" },
+  "chineseSeasonEpisodeStripPattern":{ "re": "第\\s*[零一二三四五六七八九十\\d]{1,4}\\s*[季集話话回]", "flags": "g" },
+
+  "releaseGroupPattern":         { "re": "[-]\\s*([A-Za-z][A-Za-z0-9]{1,9})\\s*$" },
+  "releaseGroupFallbackPattern": { "re": "[-.]\\s*([A-Za-z][A-Za-z0-9]{1,9})\\s*$" },
+
+  "titleStripModifiersPattern":  { "re": "\\b(COMPLETE|PROPER|REPACK|EXTENDED|UNCUT|DC|Director's\\s*Cut|Theatrical)\\b", "flags": "gi" },
+
+  "subtitleLanguagePatterns": [
+    { "lang": "chs", "re": "\\.(chs|chi|zh|cn|sc|简|中文)", "flags": "i" },
+    { "lang": "cht", "re": "\\.(cht|tc|繁)",                "flags": "i" },
+    { "lang": "eng", "re": "\\.(eng|en|英文|英)",           "flags": "i" },
+    { "lang": "jpn", "re": "\\.(jpn|jp|ja|日文|日)",        "flags": "i" },
+    { "lang": "kor", "re": "\\.(kor|kr|ko|韩文|韩)",        "flags": "i" }
+  ]
+}

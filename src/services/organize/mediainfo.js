@@ -1,5 +1,6 @@
 import { logger } from '../logger.js';
 import { getMediaInfo } from '../ffprobe.js';
+import { joinList } from '../parser.js';
 
 /**
  * 调用 ffprobe 抽取媒体技术规格。未启用或失败时返回空对象，不打断流程。
@@ -34,12 +35,12 @@ export function resolutionScore(r) {
   return m ? parseInt(m[1]) : 0;
 }
 
-/** Remux/BluRay 类高码率源头判定。 */
+/** Remux/BluRay 类高码率源头判定。source 可能是数组（来自 parser）或字符串（来自 DB）。 */
 export function isRemuxLike(info) {
-  return /remux|bluray|blu-ray/i.test(info?.source || '');
+  return /remux|bluray|blu-ray/i.test(joinList(info?.source));
 }
 
-/** 含 TrueHD/Atmos/Dolby 字样视为杜比音轨。 */
+/** 含 TrueHD/Atmos/Dolby 字样视为杜比音轨。audioCodec 同样接受数组或字符串。 */
 export function hasDolby(info) {
-  return /truehd|atmos|dolby/i.test(info?.audioCodec || '');
+  return /truehd|atmos|dolby/i.test(joinList(info?.audioCodec));
 }

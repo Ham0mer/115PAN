@@ -107,7 +107,9 @@ export async function processMovieGroup(group, id, cfg, taskId, stats) {
       mediaType: 'movie',
       target_path: categoryPath.join('/') + '/' + winningFileName,
       resolution: videoUnits[0].mediaInfo.resolution,
-      source: videoUnits[0].mediaInfo.source,
+      source: Array.isArray(videoUnits[0].mediaInfo.source)
+        ? videoUnits[0].mediaInfo.source.join(' ')
+        : videoUnits[0].mediaInfo.source,
     }).catch(() => {});
   }
 }
