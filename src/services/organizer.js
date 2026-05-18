@@ -1580,7 +1580,8 @@ async function cleanupEmptyFoldersFast(rootCid, keepsFolder) {
     }
     for (const c of node.children) visit(c, isEmpty || parentIsEmpty);
   }
-  visit(rootStr, false);
+  // 根目录永不删除，故其"空"状态不应向下传播；对每个直接子节点单独入口。
+  for (const c of nodeById.get(rootStr).children) visit(c, false);
 
   logger.info('Organizer', `[fast-cleanup] 树规模: ${nodeById.size - 1} 目录 / ${files.length} 文件 (忽略垃圾/过小视频 ${droppedJunk}); 待删空分支: ${emptyBranches.length}`);
 
