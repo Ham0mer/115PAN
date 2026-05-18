@@ -30,12 +30,13 @@ taskRouter.post('/run-now', async (req, res) => {
   }
 });
 
-// Clear all non-running task records (and their items). Running tasks are preserved.
+// Clear task records with zero successes (and their items). Running tasks and tasks
+// that produced at least one successful item are preserved.
 taskRouter.post('/clear', (req, res) => {
   const db = getDb();
-  db.prepare("DELETE FROM task_items WHERE task_id IN (SELECT id FROM tasks WHERE status != 'running')").run();
-  const result = db.prepare("DELETE FROM tasks WHERE status != 'running'").run();
-  logger.info('Tasks', `已清除 ${result.changes} 条任务记录`);
+  db.prepare("DELETE FROM task_items WHERE task_id IN (SELECT id FROM tasks WHERE status != 'running' AND success_count = 0)").run();
+  const result = db.prepare("DELETE FROM tasks WHERE success_count = 0").run();
+  logger.info('Tasks', `已清除 ${result.changes} 条成功数为 0 的任务记录`);
   res.json({ success: true, deleted: result.changes });
 });
 
