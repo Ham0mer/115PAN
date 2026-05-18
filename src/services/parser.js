@@ -3,10 +3,12 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { logger } from './logger.js';
 
-// 规则全部外置到 config/parse_rules.json。这里只做"装载 + 编译一次 + 驱动"。
+// 规则全部外置到同目录 parse_rules.json。这里只做"装载 + 编译一次 + 驱动"。
 // 新文件名扛不住时，先看是不是改 JSON 即可，避免在代码里堆正则。
+// 注意：放在 src/services/ 而非 config/，是为了避开 docker-compose 的 ./config 卷挂载
+// （挂载会用宿主机目录覆盖镜像内的 /app/config，导致 ENOENT）。
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const RULES_PATH = join(__dirname, '..', '..', 'config', 'parse_rules.json');
+const RULES_PATH = join(__dirname, 'parse_rules.json');
 const RULES = JSON.parse(readFileSync(RULES_PATH, 'utf-8'));
 
 // 简易中文数字表：用于解析 "第十二集"、"第二十三话" 这类汉字数字
