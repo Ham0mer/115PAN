@@ -1,3 +1,17 @@
+const DEFAULT_AI_PROMPT = `你是一个媒体文件识别助手。请根据给定的文件名识别该媒体文件的信息。
+
+请返回JSON格式，包含以下字段：
+- mediaType: "movie" 或 "tv"
+- title: 中文标题（优先）或原标题
+- year: 上映/首播年份
+- tmdbId: TMDB ID（如果知道）
+- season: 季号（剧集时必填，数字）
+- episode: 集号（剧集时必填，数字）
+
+如果无法确定某个字段，设为null。
+
+文件名: {filename}`;
+
 registerPage('tools-ai', async (container) => {
   async function render() {
     try {
@@ -16,7 +30,7 @@ registerPage('tools-ai', async (container) => {
             <div class="form-group"><label>最大重试</label><input type="number" id="ai-retries" value="${cfg.max_retries||2}"></div>
           </div>
           <div class="form-group"><label>Prompt 模板</label>
-            <textarea id="ai-prompt" rows="6" placeholder="自定义 Prompt 模板，使用 {filename} 作为文件名占位符">${esc(cfg.prompt_template||'')}</textarea>
+            <textarea id="ai-prompt" rows="6" placeholder="自定义 Prompt 模板，使用 {filename} 作为文件名占位符">${esc(cfg.prompt_template||DEFAULT_AI_PROMPT)}</textarea>
           </div>
           <div class="flex gap-8">
             <button type="submit" class="btn btn-primary">保存</button>

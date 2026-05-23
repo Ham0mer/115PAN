@@ -99,6 +99,62 @@ export async function aiIdentify(filename, customPrompt) {
 }
 
 /**
+ * 使用 AI 从文件名中提取干净的标题和年份（不做完整媒体识别）。
+ * 用于 TMDB 第一轮匹配质量低时，让 AI 清洗标题后再走一次 TMDB。
+ *
+ * @param {string} filename 原始文件名
+ * @returns {Promise<{title, year}>} 清洗后的标题和年份
+ */
+export async function aiExtractTitle(filename) {
+  const cfg = getConfig();
+  if (!cfg?.api_key) throw new Error('AI未配置: 缺少 api_key');
+
+  const body = JSON.stringify({
+    model: cfg.model || 'gpt-3.5-turbo',
+    messages: [
+      { role: 'system', content: '你是一个精准的媒体标题提取助手。只返回JSON，不返回其他内容。' },
+      { role: 'user', content: `从以下文件名中提取媒体的正确标题和上映/首播年份。忽略分辨率、编码、音频、压制组、片源等技术信息。
+
+返回JSON: {"title": "清理后的标题", "year": 年份数字或null}
+
+文件名: ${filename}` }
+    ],
+    temperature: cfg.temperature ?? 0.1,
+    max_tokens: 200,
+  });
+
+  for (let i = 0; i < (cfg.max_retries || 2); i++) {
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), (cfg.timeout_sec || 30) * 1000);
+
+      const res = await fetch(getApiUrl(cfg), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${cfg.api_key}` },
+        body,
+        signal: controller.signal,
+      });
+      clearTimeout(timeout);
+
+      if (!res.ok) throw new Error(`AI API ${res.status}: ${res.statusText}`);
+      const data = await res.json();
+      const content = data.choices?.[0]?.message?.content || '';
+      const jsonMatch = content.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        const result = JSON.parse(jsonMatch[0]);
+        logger.info('AI', `标题提取: ${filename} → ${result.title} (${result.year || '无年份'})`);
+        return result;
+      }
+      throw new Error('AI返回无法解析');
+    } catch (err) {
+      logger.warn('AI', `标题提取失败 (${i + 1}/${cfg.max_retries || 2}): ${filename}`, err.message);
+      if (i === (cfg.max_retries || 2) - 1) throw err;
+      await new Promise(r => setTimeout(r, 1000 * (i + 1)));
+    }
+  }
+}
+
+/**
  * 简单的 AI 连通性测试：发一条 "回复OK" 的最小请求。
  * 用于 Web 端"测试连接"按钮，校验 api_key/base_url/model 是否可用。
  * @returns {Promise<true>} 成功则返回 true，失败抛出。

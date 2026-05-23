@@ -4,7 +4,7 @@ import {
   searchMovie, searchTV, searchMulti, getMovieDetails, getTVDetails,
   isAnime, getYear, getTitle,
 } from '../tmdb.js';
-import { aiIdentify } from '../ai.js';
+import { aiIdentify, aiExtractTitle } from '../ai.js';
 import { parseExts, VIDEO_EXTS_DEFAULT } from './util.js';
 
 /**
@@ -38,7 +38,33 @@ export async function identifyGroup(group, cfg) {
 
   if (!merged.tmdbId && merged.title) {
     const tmdb = await resolveViaTmdb(merged);
-    if (tmdb) Object.assign(merged, tmdb);
+    if (tmdb) {
+      const tmdbTitle = (tmdb.title || '').toLowerCase();
+      const localTitle = (merged.title || '').toLowerCase();
+      const titleOkay = tmdbTitle.includes(localTitle) || localTitle.includes(tmdbTitle);
+      const yearOkay = !merged.year || String(tmdb.year) === String(merged.year);
+
+      if (titleOkay && yearOkay) {
+        Object.assign(merged, tmdb);
+      } else if (!titleOkay && cfg.ai_enabled) {
+        // TMDB 返回的标题与本地解析不匹配，让 AI 清洗标题后再搜一次
+        try {
+          const seed = group.folderName || group.videos[0]?.name;
+          const cleaned = await aiExtractTitle(seed);
+          if (cleaned?.title && cleaned.title.toLowerCase() !== merged.title.toLowerCase()) {
+            const retry = { ...merged, title: cleaned.title, year: cleaned.year || merged.year };
+            const tmdb2 = await resolveViaTmdb(retry);
+            if (tmdb2) {
+              Object.assign(merged, tmdb2);
+              merged.identifySource = 'tmdb+ai_title';
+            }
+          }
+        } catch (err) {
+          logger.warn('Organizer', 'AI标题清洗失败', err.message);
+        }
+      }
+      // titleOkay 但 !yearOkay：同名但年份不同（重拍/续集），不采纳，让管线继续走到完整 AI 兜底
+    }
   }
 
   if (!merged.tmdbId && cfg.ai_enabled) {

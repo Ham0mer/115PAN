@@ -102,6 +102,7 @@ configRouter.put('/tmdb', (req, res) => {
   const db = getDb();
   const fields = ['api_key', 'base_url', 'image_domain', 'primary_lang', 'fallback_lang', 'timeout_sec', 'max_retries'];
   const data = req.body;
+  if (data.api_key && data.api_key.includes('****')) delete data.api_key;  // 掩码值不回写
   const sets = fields.filter(f => data[f] !== undefined).map(f => `${f}=@${f}`).join(', ');
   if (sets) {
     const stmt = db.prepare(`UPDATE config_tmdb SET ${sets}, updated_at=datetime('now','localtime') WHERE id=1`);
@@ -124,6 +125,7 @@ configRouter.put('/ai', (req, res) => {
   const db = getDb();
   const fields = ['base_url', 'api_key', 'model', 'temperature', 'timeout_sec', 'max_retries', 'prompt_template'];
   const data = req.body;
+  if (data.api_key && data.api_key.includes('****')) delete data.api_key;  // 掩码值不回写
   const sets = fields.filter(f => data[f] !== undefined).map(f => `${f}=@${f}`).join(', ');
   if (sets) {
     const stmt = db.prepare(`UPDATE config_ai SET ${sets}, updated_at=datetime('now','localtime') WHERE id=1`);
